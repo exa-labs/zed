@@ -20,6 +20,112 @@ const PARSE_OPTIONS: Options = Options::ENABLE_TABLES
     .union(Options::ENABLE_OLD_FOOTNOTES)
     .union(Options::ENABLE_GFM);
 
+fn preprocess_wikilinks(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+    
+    while let Some((i, ch)) = chars.next() {
+        if ch == '!' {
+            if let Some(&(_, '[')) = chars.peek() {
+                chars.next(); // consume first '['
+                if let Some(&(_, '[')) = chars.peek() {
+                    chars.next(); // consume second '['
+                    
+                    let start = i + 3;
+                    let mut content = String::new();
+                    let mut found_closing = false;
+                    
+                    while let Some((_, c)) = chars.next() {
+                        if c == ']' {
+                            if let Some(&(_, ']')) = chars.peek() {
+                                chars.next(); // consume second ']'
+                                found_closing = true;
+                                break;
+                            } else {
+                                content.push(c);
+                            }
+                        } else {
+                            content.push(c);
+                        }
+                    }
+                    
+                    if found_closing {
+                        if let Some(pipe_pos) = content.find('|') {
+                            let (path, alt) = content.split_at(pipe_pos);
+                            let alt = &alt[1..]; // skip the pipe
+                            result.push_str(&format!("![{}]({})", alt, path));
+                        } else {
+                            result.push_str(&format!("![{}]({})", content, content));
+                        }
+                        continue;
+                    } else {
+                        // Malformed, keep original
+                        result.push('!');
+                        result.push('[');
+                        result.push('[');
+                        result.push_str(&content);
+                        continue;
+                    }
+                } else {
+                    result.push('!');
+                    result.push('[');
+                    continue;
+                }
+            } else {
+                result.push(ch);
+                continue;
+            }
+        }
+        
+        if ch == '[' {
+            if let Some(&(_, '[')) = chars.peek() {
+                chars.next(); // consume second '['
+                
+                let mut content = String::new();
+                let mut found_closing = false;
+                
+                while let Some((_, c)) = chars.next() {
+                    if c == ']' {
+                        if let Some(&(_, ']')) = chars.peek() {
+                            chars.next(); // consume second ']'
+                            found_closing = true;
+                            break;
+                        } else {
+                            content.push(c);
+                        }
+                    } else {
+                        content.push(c);
+                    }
+                }
+                
+                if found_closing {
+                    if let Some(pipe_pos) = content.find('|') {
+                        let (link, display) = content.split_at(pipe_pos);
+                        let display = &display[1..]; // skip the pipe
+                        result.push_str(&format!("[{}]({})", display, link));
+                    } else {
+                        result.push_str(&format!("[{}]({})", content, content));
+                    }
+                    continue;
+                } else {
+                    // Malformed, keep original
+                    result.push('[');
+                    result.push('[');
+                    result.push_str(&content);
+                    continue;
+                }
+            } else {
+                result.push(ch);
+                continue;
+            }
+        }
+        
+        result.push(ch);
+    }
+    
+    result
+}
+
 pub fn parse_markdown(
     text: &str,
 ) -> (
@@ -27,6 +133,9 @@ pub fn parse_markdown(
     HashSet<SharedString>,
     HashSet<Arc<str>>,
 ) {
+    let preprocessed_text = preprocess_wikilinks(text);
+    let text = preprocessed_text.as_str();
+    
     let mut events = Vec::new();
     let mut language_names = HashSet::default();
     let mut language_paths = HashSet::default();
@@ -825,6 +934,87 @@ mod tests {
                 (43..55, Text),
                 (0..55, End(MarkdownTagEnd::Paragraph))
             ]
+        );
+    }
+
+    #[test]
+    fn test_wikilink_basic() {
+        let result = parse_markdown("This is a [[wikilink]] in text.").0;
+        assert!(result.iter().any(|(_, event)| {
+            matches!(event, Start(Link { dest_url, .. }) if dest_url.as_ref() == "wikilink")
+        }));
+    }
+
+    #[test]
+    fn test_wikilink_with_pipe() {
+        let result = parse_markdown("This is a [[target|display text]] link.").0;
+        assert!(result.iter().any(|(_, event)| {
+            matches!(event, Start(Link { dest_url, .. }) if dest_url.as_ref() == "target")
+        }));
+    }
+
+    #[test]
+    fn test_wikilink_with_heading() {
+        let result = parse_markdown("Link to [[page#heading]] section.").0;
+        assert!(result.iter().any(|(_, event)| {
+            matches!(event, Start(Link { dest_url, .. }) if dest_url.as_ref() == "page#heading")
+        }));
+    }
+
+    #[test]
+    fn test_wikilink_image() {
+        let result = parse_markdown("Embed an image: ![[image.png]]").0;
+        assert!(result.iter().any(|(_, event)| {
+            matches!(event, Start(Image { dest_url, .. }) if dest_url.as_ref() == "image.png")
+        }));
+    }
+
+    #[test]
+    fn test_wikilink_image_with_alt() {
+        let result = parse_markdown("Image with alt: ![[image.png|Alt text]]").0;
+        assert!(result.iter().any(|(_, event)| {
+            matches!(event, Start(Image { dest_url, .. }) if dest_url.as_ref() == "image.png")
+        }));
+    }
+
+    #[test]
+    fn test_multiple_wikilinks() {
+        let result = parse_markdown("[[first]] and [[second]] links.").0;
+        let link_count = result.iter().filter(|(_, event)| {
+            matches!(event, Start(Link { .. }))
+        }).count();
+        assert_eq!(link_count, 2);
+    }
+
+    #[test]
+    fn test_wikilink_malformed() {
+        let result = parse_markdown("This is [[incomplete").0;
+        assert!(result.iter().any(|(_, event)| {
+            matches!(event, Text)
+        }));
+    }
+
+    #[test]
+    fn test_preprocess_wikilinks() {
+        assert_eq!(
+            preprocess_wikilinks("[[link]]"),
+            "[link](link)"
+        );
+        assert_eq!(
+            preprocess_wikilinks("[[target|display]]"),
+            "[display](target)"
+        );
+        assert_eq!(
+            preprocess_wikilinks("![[image.png]]"),
+            "![image.png](image.png)"
+        );
+        assert_eq!(
+            preprocess_wikilinks("![[image.png|alt text]]"),
+            "![alt text](image.png)"
+        );
+        assert_eq!(
+            preprocess_wikilinks("Normal [link](url) and [[wikilink]]"),
+            "Normal [link](url) and [wikilink](wikilink)"
         );
     }
 }
