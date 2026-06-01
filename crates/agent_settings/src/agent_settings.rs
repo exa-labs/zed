@@ -171,6 +171,14 @@ pub struct AgentSettings {
     pub show_turn_stats: bool,
     pub show_merge_conflict_indicator: bool,
     pub tool_permissions: ToolPermissions,
+    pub message_editor_language_server: MessageEditorLanguageServerSettings,
+}
+
+/// Resolved settings for running a language server inside the message editor.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageEditorLanguageServerSettings {
+    pub enabled: bool,
+    pub root_dir: Option<std::path::PathBuf>,
 }
 
 impl AgentSettings {
@@ -676,6 +684,13 @@ impl Settings for AgentSettings {
             show_turn_stats: agent.show_turn_stats.unwrap(),
             show_merge_conflict_indicator: agent.show_merge_conflict_indicator.unwrap(),
             tool_permissions: compile_tool_permissions(agent.tool_permissions),
+            message_editor_language_server: {
+                let content = agent.message_editor_language_server.unwrap_or_default();
+                MessageEditorLanguageServerSettings {
+                    enabled: content.enabled.unwrap_or(false),
+                    root_dir: content.root_dir,
+                }
+            },
         }
     }
 }

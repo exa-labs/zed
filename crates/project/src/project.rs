@@ -3204,6 +3204,59 @@ impl Project {
         })
     }
 
+    /// Associates `buffer` with a worktree rooted at `root_dir` (creating an
+    /// invisible worktree if necessary) and registers it with the language
+    /// servers configured for `language_name`.
+    ///
+    /// The buffer is given a synthetic [`File`] at `file_name` inside that
+    /// worktree even though no such file exists on disk. This makes in-memory
+    /// buffers - such as the agent panel's message editor - eligible for
+    /// language server support (for example markdown-oxide `[[wikilink]]`
+    /// completions resolved against a vault directory), which otherwise only
+    /// attaches to buffers backed by a project file.
+    ///
+    /// `buffer` must already be tracked by this project's buffer store (e.g.
+    /// created via [`BufferStore::create_local_buffer`]) so that edits are
+    /// forwarded to the language server. The returned [`OpenLspBufferHandle`]
+    /// must be retained for as long as language server support is desired.
+    pub fn register_virtual_buffer_with_language_servers(
+        &mut self,
+        buffer: Entity<Buffer>,
+        language_name: LanguageName,
+        root_dir: PathBuf,
+        file_name: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<OpenLspBufferHandle>> {
+        if !self.is_local() {
+            return Task::ready(Err(anyhow!(
+                "language servers in virtual buffers are only supported in local projects"
+            )));
+        }
+        let languages = self.languages().clone();
+        let worktree_task = self.find_or_create_worktree(&root_dir, false, cx);
+        cx.spawn(async move |this, cx| {
+            let language = languages.language_for_name(language_name.as_ref()).await?;
+            let (worktree, _) = worktree_task.await?;
+            let path_style = worktree.read_with(cx, |worktree, _| worktree.path_style());
+            let path = RelPath::new(Path::new(&file_name), path_style)?.into_arc();
+            let file = Arc::new(File {
+                worktree,
+                path,
+                disk_state: DiskState::New,
+                entry_id: None,
+                is_local: true,
+                is_private: false,
+            });
+            this.update(cx, |this, cx| {
+                buffer.update(cx, |buffer, cx| {
+                    buffer.set_language(Some(language), cx);
+                    buffer.file_updated(file, cx);
+                });
+                this.register_buffer_with_language_servers(&buffer, cx)
+            })
+        })
+    }
+
     pub fn open_unstaged_diff(
         &mut self,
         buffer: Entity<Buffer>,

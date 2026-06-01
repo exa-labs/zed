@@ -1215,6 +1215,17 @@
     //
     // Default: true
     "show_merge_conflict_indicator": true,
+    // Whether to attach a Markdown language server (such as markdown-oxide) to
+    // the agent panel message editor, so completions like `[[wikilinks]]` work
+    // while typing prompts. The message editor is treated as a virtual Markdown
+    // buffer rooted at `root_dir` (or the first project worktree when unset).
+    "message_editor_language_server": {
+      // Whether the language server is attached to the message editor.
+      "enabled": false,
+      // Absolute path to the directory the language server resolves against.
+      // When null, the first project worktree is used.
+      "root_dir": null
+    },
   },
   // Whether the screen sharing icon is shown in the os status bar.
   "show_call_status_icon": true,

@@ -27,9 +27,11 @@ use gpui::{
     Focusable, ImageFormat, KeyContext, SharedString, Subscription, Task, TaskExt, TextStyle,
     WeakEntity,
 };
-use language::{Buffer, language_settings::InlayHintKind};
+use agent_settings::AgentSettings;
+use language::{Buffer, LanguageName, language_settings::InlayHintKind};
 use parking_lot::RwLock;
 use project::AgentId;
+use project::lsp_store::OpenLspBufferHandle;
 use project::{
     CompletionIntent, InlayHint, InlayHintLabel, InlayId, Project, ProjectPath, Worktree,
 };
@@ -42,6 +44,11 @@ use util::paths::PathStyle;
 use util::{ResultExt, debug_panic};
 use workspace::{CollaboratorId, Workspace};
 use zed_actions::agent::{Chat, PasteRaw};
+
+/// Synthetic file name for the message editor's virtual buffer. Only its
+/// extension and parent directory matter to the language server; the file
+/// itself never exists on disk.
+const MESSAGE_EDITOR_FILE_NAME: &str = "agent-message.md";
 
 #[derive(Default)]
 pub struct SessionCapabilities {
@@ -188,6 +195,10 @@ pub struct MessageEditor {
     session_capabilities: SharedSessionCapabilities,
     agent_id: AgentId,
     thread_store: Option<Entity<ThreadStore>>,
+    /// Keeps the message editor buffer registered with language servers (e.g.
+    /// markdown-oxide for `[[wikilink]]` completions). Dropping this handle
+    /// unregisters the buffer.
+    _message_editor_lsp_handle: Option<OpenLspBufferHandle>,
     _subscriptions: Vec<Subscription>,
     _parse_slash_command_task: Task<()>,
 }
@@ -463,15 +474,34 @@ impl MessageEditor {
             .upgrade()
             .map(|project| project.read(cx).languages().clone());
 
-        let editor = cx.new(|cx| {
-            let buffer = cx.new(|cx| {
+        let lsp_settings = AgentSettings::get_global(cx)
+            .message_editor_language_server
+            .clone();
+        let lsp_project = project
+            .upgrade()
+            .filter(|_| lsp_settings.enabled)
+            .filter(|project| project.read(cx).is_local());
+
+        let buffer = if let Some(project) = lsp_project.as_ref() {
+            // Create the buffer through the project's buffer store so that edits
+            // are forwarded to language servers; a bare `Buffer::local` is not
+            // tracked by the project and never reaches them.
+            let buffer_store = project.read(cx).buffer_store().clone();
+            buffer_store.update(cx, |buffer_store, cx| {
+                buffer_store.create_local_buffer("", None, false, cx)
+            })
+        } else {
+            cx.new(|cx| {
                 let buffer = Buffer::local("", cx);
                 if let Some(language_registry) = language_registry.as_ref() {
                     buffer.set_language_registry(language_registry.clone());
                 }
                 buffer
-            });
-            let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+            })
+        };
+
+        let editor = cx.new(|cx| {
+            let buffer = cx.new(|cx| MultiBuffer::singleton(buffer.clone(), cx));
 
             let mut editor = Editor::new(mode, buffer, None, window, cx);
             editor.set_placeholder_text(placeholder, window, cx);
@@ -582,7 +612,38 @@ impl MessageEditor {
             }
         }));
 
-        if let Some(language_registry) = language_registry {
+        if let Some(project) = lsp_project {
+            // The root directory the language server resolves against: an
+            // explicit `root_dir` setting, otherwise the first project worktree.
+            let root_dir = lsp_settings.root_dir.or_else(|| {
+                project
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+            });
+
+            if let Some(root_dir) = root_dir {
+                let buffer = buffer.clone();
+                let register = project.update(cx, |project, cx| {
+                    project.register_virtual_buffer_with_language_servers(
+                        buffer,
+                        LanguageName::new("Markdown"),
+                        root_dir,
+                        MESSAGE_EDITOR_FILE_NAME.into(),
+                        cx,
+                    )
+                });
+                cx.spawn(async move |this, cx| {
+                    let handle = register.await?;
+                    this.update(cx, |this, _| {
+                        this._message_editor_lsp_handle = Some(handle);
+                    })?;
+                    anyhow::Ok(())
+                })
+                .detach_and_log_err(cx);
+            }
+        } else if let Some(language_registry) = language_registry {
             let editor = editor.clone();
             cx.spawn(async move |_, cx| {
                 let markdown = language_registry.language_for_name("Markdown").await?;
@@ -605,6 +666,7 @@ impl MessageEditor {
             session_capabilities,
             agent_id,
             thread_store,
+            _message_editor_lsp_handle: None,
             _subscriptions: subscriptions,
             _parse_slash_command_task: Task::ready(()),
         }

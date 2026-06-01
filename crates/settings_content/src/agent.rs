@@ -214,6 +214,28 @@ pub struct AgentSettingsContent {
     /// `always_confirm`) match against the tool's text input (command, path,
     /// URL, etc.).
     pub tool_permissions: Option<ToolPermissionsContent>,
+    /// Whether to attach a language server to the agent panel message editor.
+    pub message_editor_language_server: Option<MessageEditorLanguageServerContent>,
+}
+
+/// Settings for running a language server inside the agent panel message editor.
+///
+/// The message editor isn't backed by a file on disk, so language servers don't
+/// normally attach to it. Enabling this treats the editor as a virtual Markdown
+/// buffer rooted at `root_dir`, which lets a Markdown language server (such as
+/// markdown-oxide) provide completions like `[[wikilinks]]` while typing prompts.
+#[with_fallible_options]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema, MergeFrom)]
+pub struct MessageEditorLanguageServerContent {
+    /// Whether to attach a Markdown language server to the message editor.
+    ///
+    /// Default: false
+    pub enabled: Option<bool>,
+    /// Absolute path to the directory the language server resolves against (the
+    /// "vault" root). When unset, the first worktree of the project is used.
+    ///
+    /// Default: null
+    pub root_dir: Option<PathBuf>,
 }
 
 impl AgentSettingsContent {

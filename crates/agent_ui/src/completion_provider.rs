@@ -1,6 +1,8 @@
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::ops::Range;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -1261,7 +1263,7 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
         &self,
         buffer: &Entity<Buffer>,
         buffer_position: Anchor,
-        _trigger: CompletionContext,
+        trigger: CompletionContext,
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) -> Task<Result<Vec<CompletionResponse>>> {
@@ -1274,7 +1276,20 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
             PromptCompletion::try_parse(line, offset_to_line, &self.source.supported_modes(cx))
         });
         let Some(state) = state else {
-            return Task::ready(Ok(Vec::new()));
+            // Not an `@mention` or `/command`. When the message editor is backed
+            // by a worktree file (see `Project::register_virtual_buffer_with_language_servers`),
+            // delegate to the language server so completions like `[[wikilinks]]`
+            // work. Otherwise there is nothing to complete.
+            if buffer.read(cx).file().is_none() {
+                return Task::ready(Ok(Vec::new()));
+            }
+            let Some(workspace) = self.workspace.upgrade() else {
+                return Task::ready(Ok(Vec::new()));
+            };
+            let project = workspace.read(cx).project().clone();
+            return project.update(cx, |project, cx| {
+                project.completions(buffer, buffer_position, trigger, cx)
+            });
         };
 
         let Some(workspace) = self.workspace.upgrade() else {
@@ -1677,15 +1692,66 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
         }
     }
 
+    fn resolve_completions(
+        &self,
+        buffer: Entity<Buffer>,
+        completion_indices: Vec<usize>,
+        completions: Rc<RefCell<Box<[Completion]>>>,
+        cx: &mut Context<Editor>,
+    ) -> Task<Result<bool>> {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return Task::ready(Ok(false));
+        };
+        let project = workspace.read(cx).project().clone();
+        project.update(cx, |project, cx| {
+            project.lsp_store().update(cx, |lsp_store, cx| {
+                lsp_store.resolve_completions(buffer, completion_indices, completions, cx)
+            })
+        })
+    }
+
+    fn apply_additional_edits_for_completion(
+        &self,
+        buffer: Entity<Buffer>,
+        completions: Rc<RefCell<Box<[Completion]>>>,
+        completion_index: usize,
+        push_to_history: bool,
+        all_commit_ranges: Vec<Range<language::Anchor>>,
+        cx: &mut Context<Editor>,
+    ) -> Task<Result<Option<language::Transaction>>> {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return Task::ready(Ok(None));
+        };
+        let project = workspace.read(cx).project().clone();
+        project.update(cx, |project, cx| {
+            project.lsp_store().update(cx, |lsp_store, cx| {
+                lsp_store.apply_additional_edits_for_completion(
+                    buffer,
+                    completions,
+                    completion_index,
+                    push_to_history,
+                    all_commit_ranges,
+                    cx,
+                )
+            })
+        })
+    }
+
     fn is_completion_trigger(
         &self,
         buffer: &Entity<language::Buffer>,
         position: language::Anchor,
-        _text: &str,
+        text: &str,
         _trigger_in_words: bool,
         cx: &mut Context<Editor>,
     ) -> bool {
         let buffer = buffer.read(cx);
+        // When the message editor is backed by a worktree file, also trigger on
+        // the language server's trigger characters (e.g. `[` for markdown-oxide
+        // `[[wikilinks]]`).
+        if buffer.file().is_some() && buffer.completion_triggers().contains(text) {
+            return true;
+        }
         let position = position.to_point(buffer);
         let line_start = Point::new(position.row, 0);
         let offset_to_line = buffer.point_to_offset(line_start);
