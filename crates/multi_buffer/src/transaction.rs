@@ -1,16 +1,16 @@
 use gpui::{App, Context, Entity};
-use language::{self, Buffer, TextDimension, TransactionId};
+use language::{self, Buffer, BufferEditSource, TransactionId};
 use std::{
     collections::HashMap,
-    ops::{Range, Sub},
+    ops::Range,
     time::{Duration, Instant},
 };
 use sum_tree::Bias;
 use text::BufferId;
 
-use crate::BufferState;
+use crate::{Anchor, BufferState, MultiBufferOffset};
 
-use super::{Event, ExcerptSummary, MultiBuffer};
+use super::{Event, MultiBuffer};
 
 #[derive(Clone)]
 pub(super) struct History {
@@ -288,6 +288,35 @@ impl MultiBuffer {
         self.end_transaction_at(Instant::now(), cx)
     }
 
+    pub fn end_transaction_with_source(
+        &mut self,
+        source: BufferEditSource,
+        cx: &mut Context<Self>,
+    ) -> Option<TransactionId> {
+        let now = Instant::now();
+        if let Some(buffer) = self.as_singleton() {
+            return buffer.update(cx, |buffer, cx| {
+                buffer.end_transaction_with_source(source, cx)
+            });
+        }
+
+        let mut buffer_transactions = HashMap::default();
+        for BufferState { buffer, .. } in self.buffers.values() {
+            if let Some(transaction_id) = buffer.update(cx, |buffer, cx| {
+                buffer.end_transaction_with_source(source, cx)
+            }) {
+                buffer_transactions.insert(buffer.read(cx).remote_id(), transaction_id);
+            }
+        }
+
+        if self.history.end_transaction(now, buffer_transactions) {
+            let transaction_id = self.history.group().unwrap();
+            Some(transaction_id)
+        } else {
+            None
+        }
+    }
+
     pub fn end_transaction_at(
         &mut self,
         now: Instant,
@@ -314,57 +343,50 @@ impl MultiBuffer {
         }
     }
 
-    pub fn edited_ranges_for_transaction<D>(
+    pub fn edited_ranges_for_transaction(
         &self,
         transaction_id: TransactionId,
         cx: &App,
-    ) -> Vec<Range<D>>
-    where
-        D: TextDimension + Ord + Sub<D, Output = D>,
-    {
+    ) -> Vec<Range<MultiBufferOffset>> {
         let Some(transaction) = self.history.transaction(transaction_id) else {
             return Vec::new();
         };
 
-        let mut ranges = Vec::new();
         let snapshot = self.read(cx);
-        let mut cursor = snapshot.excerpts.cursor::<ExcerptSummary>(());
+        let mut buffer_anchors = Vec::new();
 
         for (buffer_id, buffer_transaction) in &transaction.buffer_transactions {
-            let Some(buffer_state) = self.buffers.get(buffer_id) else {
+            let Some(buffer) = self.buffer(*buffer_id) else {
                 continue;
             };
+            let Some(excerpt) = snapshot.first_excerpt_for_buffer(*buffer_id) else {
+                continue;
+            };
+            let buffer_snapshot = buffer.read(cx).snapshot();
 
-            let buffer = buffer_state.buffer.read(cx);
-            for range in buffer.edited_ranges_for_transaction_id::<D>(*buffer_transaction) {
-                for excerpt_id in &buffer_state.excerpts {
-                    cursor.seek(excerpt_id, Bias::Left);
-                    if let Some(excerpt) = cursor.item()
-                        && excerpt.locator == *excerpt_id
-                    {
-                        let excerpt_buffer_start = excerpt.range.context.start.summary::<D>(buffer);
-                        let excerpt_buffer_end = excerpt.range.context.end.summary::<D>(buffer);
-                        let excerpt_range = excerpt_buffer_start..excerpt_buffer_end;
-                        if excerpt_range.contains(&range.start)
-                            && excerpt_range.contains(&range.end)
-                        {
-                            let excerpt_start = D::from_text_summary(&cursor.start().text);
-
-                            let mut start = excerpt_start;
-                            start.add_assign(&(range.start - excerpt_buffer_start));
-                            let mut end = excerpt_start;
-                            end.add_assign(&(range.end - excerpt_buffer_start));
-
-                            ranges.push(start..end);
-                            break;
-                        }
-                    }
-                }
+            for range in buffer
+                .read(cx)
+                .edited_ranges_for_transaction_id::<usize>(*buffer_transaction)
+            {
+                buffer_anchors.push(Anchor::in_buffer(
+                    excerpt.path_key_index,
+                    buffer_snapshot.anchor_at(range.start, Bias::Left),
+                ));
+                buffer_anchors.push(Anchor::in_buffer(
+                    excerpt.path_key_index,
+                    buffer_snapshot.anchor_at(range.end, Bias::Right),
+                ));
             }
         }
+        buffer_anchors.sort_unstable_by(|a, b| a.cmp(b, &snapshot));
 
-        ranges.sort_by_key(|range| range.start);
-        ranges
+        snapshot
+            .summaries_for_anchors(buffer_anchors.iter())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[s, e]| s..e)
+            .collect::<Vec<_>>()
     }
 
     pub fn merge_transactions(

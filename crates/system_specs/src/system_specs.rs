@@ -1,10 +1,8 @@
-//! # system_specs
-
-use client::telemetry;
 pub use gpui::GpuSpecs;
-use gpui::{App, AppContext as _, SemanticVersion, Task, Window, actions};
+use gpui::{App, AppContext as _, Task, Window, actions};
 use human_bytes::human_bytes;
 use release_channel::{AppCommitSha, AppVersion, ReleaseChannel};
+use semver::Version;
 use serde::Serialize;
 use std::{env, fmt::Display};
 use sysinfo::{MemoryRefreshKind, RefreshKind, System};
@@ -31,10 +29,14 @@ pub struct SystemSpecs {
 }
 
 impl SystemSpecs {
-    pub fn new(window: &mut Window, cx: &mut App) -> Task<Self> {
+    pub fn new(
+        window: &mut Window,
+        cx: &mut App,
+        os_name: String,
+        os_version: String,
+    ) -> Task<Self> {
         let app_version = AppVersion::global(cx).to_string();
         let release_channel = ReleaseChannel::global(cx);
-        let os_name = telemetry::os_name();
         let system = System::new_with_specifics(
             RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
         );
@@ -56,7 +58,6 @@ impl SystemSpecs {
         });
 
         cx.background_spawn(async move {
-            let os_version = telemetry::os_version();
             SystemSpecs {
                 app_version,
                 release_channel: release_channel.display_name(),
@@ -72,12 +73,12 @@ impl SystemSpecs {
     }
 
     pub fn new_stateless(
-        app_version: SemanticVersion,
+        app_version: Version,
         app_commit_sha: Option<AppCommitSha>,
         release_channel: ReleaseChannel,
+        os_name: String,
+        os_version: String,
     ) -> Self {
-        let os_name = telemetry::os_name();
-        let os_version = telemetry::os_version();
         let system = System::new_with_specifics(
             RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
         );

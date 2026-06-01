@@ -7,13 +7,14 @@ use git::{
     status::{DiffTreeType, FileStatus, StatusCode, TrackedStatus, TreeDiff, TreeDiffStatus},
 };
 use gpui::{
-    App, AsyncWindowContext, Context, Entity, EventEmitter, SharedString, Subscription, Task,
-    WeakEntity, Window,
+    App, AsyncApp, AsyncWindowContext, Context, Entity, EventEmitter, SharedString, Subscription,
+    Task, WeakEntity, Window,
 };
 
 use language::Buffer;
 use text::BufferId;
 use util::ResultExt;
+use ztracing::instrument;
 
 use crate::{
     Project,
@@ -39,6 +40,8 @@ pub struct BranchDiff {
     base_commit: Option<SharedString>,
     head_commit: Option<SharedString>,
     tree_diff: Option<TreeDiff>,
+    tree_diff_update_needed: bool,
+    tree_diff_base_task: Option<Task<()>>,
     _subscription: Subscription,
     update_needed: postage::watch::Sender<()>,
     _task: Task<()>,
@@ -46,6 +49,7 @@ pub struct BranchDiff {
 
 pub enum BranchDiffEvent {
     FileListChanged,
+    DiffBaseChanged,
 }
 
 impl EventEmitter<BranchDiffEvent> for BranchDiff {}
@@ -58,21 +62,31 @@ impl BranchDiff {
         cx: &mut Context<Self>,
     ) -> Self {
         let git_store = project.read(cx).git_store().clone();
+        let repo = git_store.read(cx).active_repository();
         let git_store_subscription = cx.subscribe_in(
             &git_store,
             window,
-            move |this, _git_store, event, _window, cx| match event {
-                GitStoreEvent::ActiveRepositoryChanged(_)
-                | GitStoreEvent::RepositoryUpdated(
-                    _,
-                    RepositoryEvent::StatusesChanged { full_scan: _ },
-                    true,
-                )
-                | GitStoreEvent::ConflictsUpdated => {
+            move |this, _git_store, event, _window, cx| {
+                let should_update = match event {
+                    GitStoreEvent::ActiveRepositoryChanged(new_repo_id) => {
+                        this.repo.is_none() && new_repo_id.is_some()
+                    }
+                    GitStoreEvent::RepositoryUpdated(
+                        event_repo_id,
+                        RepositoryEvent::StatusesChanged | RepositoryEvent::HeadChanged,
+                        _,
+                    ) => this
+                        .repo
+                        .as_ref()
+                        .is_some_and(|r| r.read(cx).snapshot().id == *event_repo_id),
+                    GitStoreEvent::ConflictsUpdated => this.repo.is_some(),
+                    _ => false,
+                };
+
+                if should_update {
                     cx.emit(BranchDiffEvent::FileListChanged);
                     *this.update_needed.borrow_mut() = ();
                 }
-                _ => {}
             },
         );
 
@@ -81,13 +95,14 @@ impl BranchDiff {
             let this = cx.weak_entity();
             async |cx| Self::handle_status_updates(this, recv, cx).await
         });
-        let repo = git_store.read(cx).active_repository();
 
         Self {
             diff_base: source,
             repo,
             project,
             tree_diff: None,
+            tree_diff_update_needed: false,
+            tree_diff_base_task: None,
             base_commit: None,
             head_commit: None,
             _subscription: git_store_subscription,
@@ -100,24 +115,67 @@ impl BranchDiff {
         &self.diff_base
     }
 
+    pub fn set_repo(&mut self, repo: Option<Entity<Repository>>, cx: &mut Context<Self>) {
+        let same_repo = match (self.repo.as_ref(), repo.as_ref()) {
+            (Some(current), Some(new)) => current.read(cx).id == new.read(cx).id,
+            (None, None) => true,
+            _ => false,
+        };
+        if same_repo {
+            return;
+        }
+
+        self.repo = repo;
+        self.tree_diff = None;
+        self.tree_diff_update_needed = self.diff_base.is_merge_base();
+        self.tree_diff_base_task = None;
+        self.base_commit = None;
+        self.head_commit = None;
+        cx.emit(BranchDiffEvent::FileListChanged);
+        *self.update_needed.borrow_mut() = ();
+    }
+
+    pub fn set_diff_base(&mut self, diff_base: DiffBase, cx: &mut Context<Self>) {
+        if self.diff_base == diff_base {
+            return;
+        }
+
+        self.tree_diff_update_needed = diff_base.is_merge_base();
+        self.tree_diff = None;
+        self.tree_diff_base_task = None;
+        self.diff_base = diff_base;
+        self.base_commit = None;
+        self.head_commit = None;
+
+        cx.emit(BranchDiffEvent::DiffBaseChanged);
+        if self.tree_diff_update_needed {
+            *self.update_needed.borrow_mut() = ();
+        }
+    }
+
     pub async fn handle_status_updates(
         this: WeakEntity<Self>,
         mut recv: postage::watch::Receiver<()>,
         cx: &mut AsyncWindowContext,
     ) {
-        Self::reload_tree_diff(this.clone(), cx).await.log_err();
+        this.update(cx, |this, cx| this.spawn_reload_tree_diff(cx))
+            .log_err();
         while recv.next().await.is_some() {
-            let Ok(needs_update) = this.update(cx, |this, cx| {
-                let mut needs_update = false;
-                let active_repo = this
-                    .project
-                    .read(cx)
-                    .git_store()
-                    .read(cx)
-                    .active_repository();
-                if active_repo != this.repo {
-                    needs_update = true;
-                    this.repo = active_repo;
+            let Ok(()) = this.update(cx, |this, cx| {
+                let mut needs_update = this.tree_diff_update_needed;
+                this.tree_diff_update_needed = false;
+
+                if this.repo.is_none() {
+                    let active_repo = this
+                        .project
+                        .read(cx)
+                        .git_store()
+                        .read(cx)
+                        .active_repository();
+                    if active_repo.is_some() {
+                        this.repo = active_repo;
+                        needs_update = true;
+                    }
                 } else if let Some(repo) = this.repo.as_ref() {
                     repo.update(cx, |repo, _| {
                         if let Some(branch) = &repo.branch
@@ -136,14 +194,13 @@ impl BranchDiff {
                         }
                     })
                 }
-                needs_update
+
+                if needs_update {
+                    this.spawn_reload_tree_diff(cx);
+                }
             }) else {
                 return;
             };
-
-            if needs_update {
-                Self::reload_tree_diff(this.clone(), cx).await.log_err();
-            }
         }
     }
 
@@ -222,10 +279,26 @@ impl BranchDiff {
         }
     }
 
-    pub async fn reload_tree_diff(
-        this: WeakEntity<Self>,
-        cx: &mut AsyncWindowContext,
-    ) -> Result<()> {
+    fn spawn_reload_tree_diff(&mut self, cx: &mut Context<Self>) {
+        if !self.diff_base.is_merge_base() {
+            return;
+        }
+
+        let task = cx.spawn(async move |this, cx| {
+            Self::reload_tree_diff(this, cx).await.log_err();
+        });
+
+        self.tree_diff_base_task = Some(task);
+        cx.notify();
+    }
+
+    pub fn is_tree_base_loading(&self) -> bool {
+        self.tree_diff_base_task
+            .as_ref()
+            .is_some_and(|task| !task.is_ready())
+    }
+
+    pub async fn reload_tree_diff(this: WeakEntity<Self>, cx: &mut AsyncApp) -> Result<()> {
         let task = this.update(cx, |this, cx| {
             let DiffBase::Merge { base_ref } = this.diff_base.clone() else {
                 return None;
@@ -258,11 +331,15 @@ impl BranchDiff {
         self.repo.as_ref()
     }
 
+    #[instrument(skip_all)]
     pub fn load_buffers(&mut self, cx: &mut Context<Self>) -> Vec<DiffBuffer> {
         let mut output = Vec::default();
         let Some(repo) = self.repo.clone() else {
             return output;
         };
+        if self.diff_base.is_merge_base() && self.tree_diff.is_none() {
+            return output;
+        }
 
         self.project.update(cx, |_project, cx| {
             let mut seen = HashSet::default();
@@ -322,6 +399,7 @@ impl BranchDiff {
         output
     }
 
+    #[instrument(skip_all)]
     fn load_buffer(
         branch_diff: Option<git::status::TreeDiffStatus>,
         project_path: crate::ProjectPath,
@@ -333,8 +411,6 @@ impl BranchDiff {
                 .update(cx, |project, cx| project.open_buffer(project_path, cx))?
                 .await?;
 
-            let languages = project.update(cx, |project, _cx| project.languages().clone())?;
-
             let changes = if let Some(entry) = branch_diff {
                 let oid = match entry {
                     git::status::TreeDiffStatus::Added { .. } => None,
@@ -344,7 +420,7 @@ impl BranchDiff {
                 project
                     .update(cx, |project, cx| {
                         project.git_store().update(cx, |git_store, cx| {
-                            git_store.open_diff_since(oid, buffer.clone(), repo, languages, cx)
+                            git_store.open_diff_since(oid, buffer.clone(), repo, cx)
                         })
                     })?
                     .await?

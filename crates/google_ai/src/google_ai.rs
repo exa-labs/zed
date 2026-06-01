@@ -3,8 +3,9 @@ use std::mem;
 use anyhow::{Result, anyhow, bail};
 use futures::{AsyncBufReadExt, AsyncReadExt, StreamExt, io::BufReader, stream::BoxStream};
 use http_client::{AsyncBody, HttpClient, Method, Request as HttpRequest};
+pub use language_model_core::ModelMode as GoogleModelMode;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-pub use settings::ModelMode as GoogleModelMode;
+pub mod completion;
 
 pub const API_URL: &str = "https://generativelanguage.googleapis.com";
 
@@ -63,38 +64,6 @@ pub async fn stream_generate_content(
     }
 }
 
-pub async fn count_tokens(
-    client: &dyn HttpClient,
-    api_url: &str,
-    api_key: &str,
-    request: CountTokensRequest,
-) -> Result<CountTokensResponse> {
-    validate_generate_content_request(&request.generate_content_request)?;
-
-    let uri = format!(
-        "{api_url}/v1beta/models/{model_id}:countTokens?key={api_key}",
-        model_id = &request.generate_content_request.model.model_id,
-    );
-
-    let request = serde_json::to_string(&request)?;
-    let request_builder = HttpRequest::builder()
-        .method(Method::POST)
-        .uri(&uri)
-        .header("Content-Type", "application/json");
-    let http_request = request_builder.body(AsyncBody::from(request))?;
-
-    let mut response = client.send(http_request).await?;
-    let mut text = String::new();
-    response.body_mut().read_to_string(&mut text).await?;
-    anyhow::ensure!(
-        response.status().is_success(),
-        "error during countTokens, status code: {:?}, body: {}",
-        response.status(),
-        text
-    );
-    Ok(serde_json::from_str::<CountTokensResponse>(&text)?)
-}
-
 pub fn validate_generate_content_request(request: &GenerateContentRequest) -> Result<()> {
     if request.model.is_empty() {
         bail!("Model must be specified");
@@ -122,8 +91,6 @@ pub enum Task {
     GenerateContent,
     #[serde(rename = "streamGenerateContent")]
     StreamGenerateContent,
-    #[serde(rename = "countTokens")]
-    CountTokens,
     #[serde(rename = "embedContent")]
     EmbedContent,
     #[serde(rename = "batchEmbedContents")]
@@ -199,17 +166,24 @@ pub enum Role {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Part {
-    TextPart(TextPart),
-    InlineDataPart(InlineDataPart),
     FunctionCallPart(FunctionCallPart),
     FunctionResponsePart(FunctionResponsePart),
-    ThoughtPart(ThoughtPart),
+    InlineDataPart(InlineDataPart),
+    TextPart(TextPart),
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextPart {
     pub text: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub thought: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -229,19 +203,16 @@ pub struct GenerativeContentBlob {
 #[serde(rename_all = "camelCase")]
 pub struct FunctionCallPart {
     pub function_call: FunctionCall,
+    /// Thought signature returned by the model for function calls.
+    /// Only present on the first function call in parallel call scenarios.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thought_signature: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FunctionResponsePart {
     pub function_response: FunctionResponse,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ThoughtPart {
-    pub thought: bool,
-    pub thought_signature: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -290,10 +261,54 @@ pub struct UsageMetadata {
     pub total_token_count: Option<u64>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ThinkingConfig {
-    pub thinking_budget: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_budget: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<ThinkingLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include_thoughts: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ThinkingLevel {
+    Minimal,
+    Low,
+    Medium,
+    High,
+}
+
+impl ThinkingLevel {
+    pub fn from_effort(effort: &str) -> Option<Self> {
+        match effort.to_lowercase().as_str() {
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Minimal => "Minimal",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        }
+    }
+
+    pub fn value(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -378,27 +393,19 @@ pub struct SafetyRating {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CountTokensRequest {
-    pub generate_content_request: GenerateContentRequest,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CountTokensResponse {
-    pub total_tokens: u64,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
     pub args: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FunctionResponse {
     pub name: String,
     pub response: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -480,30 +487,19 @@ impl<'de> Deserialize<'de> for ModelName {
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Default, Debug, Deserialize, Serialize, PartialEq, Eq, strum::EnumIter)]
 pub enum Model {
-    #[serde(rename = "gemini-1.5-pro")]
-    Gemini15Pro,
-    #[serde(rename = "gemini-1.5-flash-8b")]
-    Gemini15Flash8b,
-    #[serde(rename = "gemini-1.5-flash")]
-    Gemini15Flash,
     #[serde(
-        rename = "gemini-2.0-flash-lite",
+        rename = "gemini-2.5-flash-lite",
+        alias = "gemini-2.5-flash-lite-preview-06-17",
         alias = "gemini-2.0-flash-lite-preview"
     )]
-    Gemini20FlashLite,
-    #[serde(rename = "gemini-2.0-flash")]
-    Gemini20Flash,
-    #[serde(
-        rename = "gemini-2.5-flash-lite-preview",
-        alias = "gemini-2.5-flash-lite-preview-06-17"
-    )]
-    Gemini25FlashLitePreview,
+    Gemini25FlashLite,
     #[serde(
         rename = "gemini-2.5-flash",
         alias = "gemini-2.0-flash-thinking-exp",
         alias = "gemini-2.5-flash-preview-04-17",
         alias = "gemini-2.5-flash-preview-05-20",
-        alias = "gemini-2.5-flash-preview-latest"
+        alias = "gemini-2.5-flash-preview-latest",
+        alias = "gemini-2.0-flash"
     )]
     #[default]
     Gemini25Flash,
@@ -517,10 +513,18 @@ pub enum Model {
         alias = "gemini-2.5-pro-preview-06-05"
     )]
     Gemini25Pro,
+    #[serde(rename = "gemini-3.1-flash-lite")]
+    Gemini31FlashLite,
+    #[serde(rename = "gemini-3-flash-preview")]
+    Gemini3Flash,
+    #[serde(rename = "gemini-3.5-flash")]
+    Gemini35Flash,
+    #[serde(rename = "gemini-3.1-pro-preview", alias = "gemini-3-pro-preview")]
+    Gemini31Pro,
     #[serde(rename = "custom")]
     Custom {
         name: String,
-        /// The name displayed in the UI, such as in the assistant panel model dropdown menu.
+        /// The name displayed in the UI, such as in the agent panel model dropdown menu.
         display_name: Option<String>,
         max_tokens: u64,
         #[serde(default)]
@@ -530,46 +534,43 @@ pub enum Model {
 
 impl Model {
     pub fn default_fast() -> Self {
-        Self::Gemini20FlashLite
+        Self::Gemini31FlashLite
     }
 
     pub fn id(&self) -> &str {
         match self {
-            Self::Gemini15Pro => "gemini-1.5-pro",
-            Self::Gemini15Flash8b => "gemini-1.5-flash-8b",
-            Self::Gemini15Flash => "gemini-1.5-flash",
-            Self::Gemini20FlashLite => "gemini-2.0-flash-lite",
-            Self::Gemini20Flash => "gemini-2.0-flash",
-            Self::Gemini25FlashLitePreview => "gemini-2.5-flash-lite-preview",
+            Self::Gemini25FlashLite => "gemini-2.5-flash-lite",
             Self::Gemini25Flash => "gemini-2.5-flash",
             Self::Gemini25Pro => "gemini-2.5-pro",
+            Self::Gemini31FlashLite => "gemini-3.1-flash-lite",
+            Self::Gemini3Flash => "gemini-3-flash-preview",
+            Self::Gemini35Flash => "gemini-3.5-flash",
+            Self::Gemini31Pro => "gemini-3.1-pro-preview",
             Self::Custom { name, .. } => name,
         }
     }
     pub fn request_id(&self) -> &str {
         match self {
-            Self::Gemini15Pro => "gemini-1.5-pro",
-            Self::Gemini15Flash8b => "gemini-1.5-flash-8b",
-            Self::Gemini15Flash => "gemini-1.5-flash",
-            Self::Gemini20FlashLite => "gemini-2.0-flash-lite",
-            Self::Gemini20Flash => "gemini-2.0-flash",
-            Self::Gemini25FlashLitePreview => "gemini-2.5-flash-lite-preview-06-17",
+            Self::Gemini25FlashLite => "gemini-2.5-flash-lite",
             Self::Gemini25Flash => "gemini-2.5-flash",
             Self::Gemini25Pro => "gemini-2.5-pro",
+            Self::Gemini31FlashLite => "gemini-3.1-flash-lite",
+            Self::Gemini3Flash => "gemini-3-flash-preview",
+            Self::Gemini35Flash => "gemini-3.5-flash",
+            Self::Gemini31Pro => "gemini-3.1-pro-preview",
             Self::Custom { name, .. } => name,
         }
     }
 
     pub fn display_name(&self) -> &str {
         match self {
-            Self::Gemini15Pro => "Gemini 1.5 Pro",
-            Self::Gemini15Flash8b => "Gemini 1.5 Flash-8b",
-            Self::Gemini15Flash => "Gemini 1.5 Flash",
-            Self::Gemini20FlashLite => "Gemini 2.0 Flash-Lite",
-            Self::Gemini20Flash => "Gemini 2.0 Flash",
-            Self::Gemini25FlashLitePreview => "Gemini 2.5 Flash-Lite Preview",
+            Self::Gemini25FlashLite => "Gemini 2.5 Flash-Lite",
             Self::Gemini25Flash => "Gemini 2.5 Flash",
             Self::Gemini25Pro => "Gemini 2.5 Pro",
+            Self::Gemini31FlashLite => "Gemini 3.1 Flash Lite",
+            Self::Gemini3Flash => "Gemini 3 Flash",
+            Self::Gemini35Flash => "Gemini 3.5 Flash",
+            Self::Gemini31Pro => "Gemini 3.1 Pro",
             Self::Custom {
                 name, display_name, ..
             } => display_name.as_ref().unwrap_or(name),
@@ -578,28 +579,26 @@ impl Model {
 
     pub fn max_token_count(&self) -> u64 {
         match self {
-            Self::Gemini15Pro => 2_097_152,
-            Self::Gemini15Flash8b => 1_048_576,
-            Self::Gemini15Flash => 1_048_576,
-            Self::Gemini20FlashLite => 1_048_576,
-            Self::Gemini20Flash => 1_048_576,
-            Self::Gemini25FlashLitePreview => 1_000_000,
-            Self::Gemini25Flash => 1_048_576,
-            Self::Gemini25Pro => 1_048_576,
+            Self::Gemini25FlashLite
+            | Self::Gemini25Flash
+            | Self::Gemini25Pro
+            | Self::Gemini31FlashLite
+            | Self::Gemini3Flash
+            | Self::Gemini35Flash
+            | Self::Gemini31Pro => 1_048_576,
             Self::Custom { max_tokens, .. } => *max_tokens,
         }
     }
 
     pub fn max_output_tokens(&self) -> Option<u64> {
         match self {
-            Model::Gemini15Pro => Some(8_192),
-            Model::Gemini15Flash8b => Some(8_192),
-            Model::Gemini15Flash => Some(8_192),
-            Model::Gemini20FlashLite => Some(8_192),
-            Model::Gemini20Flash => Some(8_192),
-            Model::Gemini25FlashLitePreview => Some(64_000),
-            Model::Gemini25Flash => Some(65_536),
-            Model::Gemini25Pro => Some(65_536),
+            Model::Gemini25FlashLite
+            | Model::Gemini25Flash
+            | Model::Gemini25Pro
+            | Model::Gemini31FlashLite
+            | Model::Gemini3Flash
+            | Model::Gemini35Flash
+            | Model::Gemini31Pro => Some(65_536),
             Model::Custom { .. } => None,
         }
     }
@@ -612,20 +611,65 @@ impl Model {
         true
     }
 
+    pub fn supports_thinking(&self) -> bool {
+        matches!(
+            self,
+            Self::Gemini25FlashLite
+                | Self::Gemini25Flash
+                | Self::Gemini25Pro
+                | Self::Gemini31FlashLite
+                | Self::Gemini3Flash
+                | Self::Gemini35Flash
+                | Self::Gemini31Pro
+                | Self::Custom {
+                    mode: GoogleModelMode::Thinking { .. },
+                    ..
+                }
+        )
+    }
+
+    pub fn supported_thinking_levels(&self) -> &'static [ThinkingLevel] {
+        match self {
+            Self::Gemini31FlashLite | Self::Gemini3Flash | Self::Gemini35Flash => &[
+                ThinkingLevel::Minimal,
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+            ],
+            Self::Gemini31Pro => &[
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High,
+            ],
+            _ => &[],
+        }
+    }
+
+    pub fn default_thinking_level(&self) -> Option<ThinkingLevel> {
+        match self {
+            Self::Gemini31FlashLite => Some(ThinkingLevel::Minimal),
+            Self::Gemini3Flash => Some(ThinkingLevel::High),
+            Self::Gemini35Flash => Some(ThinkingLevel::Medium),
+            Self::Gemini31Pro => Some(ThinkingLevel::High),
+            _ => None,
+        }
+    }
+
     pub fn mode(&self) -> GoogleModelMode {
         match self {
-            Self::Gemini15Pro
-            | Self::Gemini15Flash8b
-            | Self::Gemini15Flash
-            | Self::Gemini20FlashLite
-            | Self::Gemini20Flash => GoogleModelMode::Default,
-            Self::Gemini25FlashLitePreview | Self::Gemini25Flash | Self::Gemini25Pro => {
+            Self::Gemini25FlashLite | Self::Gemini25Flash | Self::Gemini25Pro => {
                 GoogleModelMode::Thinking {
                     // By default these models are set to "auto", so we preserve that behavior
                     // but indicate they are capable of thinking mode
                     budget_tokens: None,
                 }
             }
+            Self::Gemini31FlashLite
+            | Self::Gemini3Flash
+            | Self::Gemini35Flash
+            | Self::Gemini31Pro => GoogleModelMode::Thinking {
+                budget_tokens: None,
+            },
             Self::Custom { mode, .. } => *mode,
         }
     }
@@ -634,5 +678,115 @@ impl Model {
 impl std::fmt::Display for Model {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.id())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_function_call_part_with_signature_serializes_correctly() {
+        let part = FunctionCallPart {
+            function_call: FunctionCall {
+                name: "test_function".to_string(),
+                args: json!({"arg": "value"}),
+                id: None,
+            },
+            thought_signature: Some("test_signature".to_string()),
+        };
+
+        let serialized = serde_json::to_value(&part).unwrap();
+
+        assert_eq!(serialized["functionCall"]["name"], "test_function");
+        assert_eq!(serialized["functionCall"]["args"]["arg"], "value");
+        assert_eq!(serialized["thoughtSignature"], "test_signature");
+    }
+
+    #[test]
+    fn test_function_call_part_without_signature_omits_field() {
+        let part = FunctionCallPart {
+            function_call: FunctionCall {
+                name: "test_function".to_string(),
+                args: json!({"arg": "value"}),
+                id: None,
+            },
+            thought_signature: None,
+        };
+
+        let serialized = serde_json::to_value(&part).unwrap();
+
+        assert_eq!(serialized["functionCall"]["name"], "test_function");
+        assert_eq!(serialized["functionCall"]["args"]["arg"], "value");
+        // thoughtSignature field should not be present when None
+        assert!(serialized.get("thoughtSignature").is_none());
+    }
+
+    #[test]
+    fn test_function_call_part_deserializes_with_signature() {
+        let json = json!({
+            "functionCall": {
+                "name": "test_function",
+                "args": {"arg": "value"}
+            },
+            "thoughtSignature": "test_signature"
+        });
+
+        let part: FunctionCallPart = serde_json::from_value(json).unwrap();
+
+        assert_eq!(part.function_call.name, "test_function");
+        assert_eq!(part.thought_signature, Some("test_signature".to_string()));
+    }
+
+    #[test]
+    fn test_function_call_part_deserializes_without_signature() {
+        let json = json!({
+            "functionCall": {
+                "name": "test_function",
+                "args": {"arg": "value"}
+            }
+        });
+
+        let part: FunctionCallPart = serde_json::from_value(json).unwrap();
+
+        assert_eq!(part.function_call.name, "test_function");
+        assert_eq!(part.thought_signature, None);
+    }
+
+    #[test]
+    fn test_function_call_part_round_trip() {
+        let original = FunctionCallPart {
+            function_call: FunctionCall {
+                name: "test_function".to_string(),
+                args: json!({"arg": "value", "nested": {"key": "val"}}),
+                id: None,
+            },
+            thought_signature: Some("round_trip_signature".to_string()),
+        };
+
+        let serialized = serde_json::to_value(&original).unwrap();
+        let deserialized: FunctionCallPart = serde_json::from_value(serialized).unwrap();
+
+        assert_eq!(deserialized.function_call.name, original.function_call.name);
+        assert_eq!(deserialized.function_call.args, original.function_call.args);
+        assert_eq!(deserialized.thought_signature, original.thought_signature);
+    }
+
+    #[test]
+    fn test_function_call_part_with_empty_signature_serializes() {
+        let part = FunctionCallPart {
+            function_call: FunctionCall {
+                name: "test_function".to_string(),
+                args: json!({"arg": "value"}),
+                id: None,
+            },
+            thought_signature: Some("".to_string()),
+        };
+
+        let serialized = serde_json::to_value(&part).unwrap();
+
+        // Empty string should still be serialized (normalization happens at a higher level)
+        assert_eq!(serialized["thoughtSignature"], "");
     }
 }

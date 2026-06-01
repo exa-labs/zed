@@ -1,6 +1,6 @@
 use ordered_float::OrderedFloat;
 use rope::{Point, Rope, TextSummary};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::{
     cmp,
     fmt::{self, Debug},
@@ -74,6 +74,20 @@ impl Matrix {
 
         self.cells[col * self.rows + row] = value;
     }
+
+    fn adjacent_columns_mut(&mut self, current_col: usize) -> (&[f64], &mut [f64]) {
+        if current_col == 0 || current_col >= self.cols {
+            panic!("column out of bounds");
+        }
+
+        let current_col_start = current_col * self.rows;
+        let previous_col_start = current_col_start - self.rows;
+        let (before_current, current_and_after) = self.cells.split_at_mut(current_col_start);
+        (
+            &before_current[previous_col_start..current_col_start],
+            &mut current_and_after[..self.rows],
+        )
+    }
 }
 
 impl Debug for Matrix {
@@ -103,7 +117,8 @@ pub struct StreamingDiff {
     scores: Matrix,
     old_text_ix: usize,
     new_text_ix: usize,
-    equal_runs: HashMap<(usize, usize), u32>,
+    previous_equal_runs: Vec<u32>,
+    current_equal_runs: Vec<u32>,
 }
 
 impl StreamingDiff {
@@ -114,9 +129,10 @@ impl StreamingDiff {
 
     pub fn new(old: String) -> Self {
         let old = old.chars().collect::<Vec<_>>();
+        let old_len = old.len();
         let mut scores = Matrix::new();
-        scores.resize(old.len() + 1, 1);
-        for i in 0..=old.len() {
+        scores.resize(old_len + 1, 1);
+        for i in 0..=old_len {
             scores.set(i, 0, i as f64 * Self::DELETION_SCORE);
         }
         Self {
@@ -125,7 +141,8 @@ impl StreamingDiff {
             scores,
             old_text_ix: 0,
             new_text_ix: 0,
-            equal_runs: Default::default(),
+            previous_equal_runs: vec![0; old_len + 1],
+            current_equal_runs: vec![0; old_len + 1],
         }
     }
 
@@ -134,30 +151,34 @@ impl StreamingDiff {
         self.scores.swap_columns(0, self.scores.cols - 1);
         self.scores
             .resize(self.old.len() + 1, self.new.len() - self.new_text_ix + 1);
-        self.equal_runs.retain(|(_i, j), _| *j == self.new_text_ix);
 
         for j in self.new_text_ix + 1..=self.new.len() {
+            self.current_equal_runs.fill(0);
             let relative_j = j - self.new_text_ix;
+            let new_char = self.new[j - 1];
+            let old = &self.old;
+            let previous_equal_runs = &self.previous_equal_runs;
+            let current_equal_runs = &mut self.current_equal_runs;
+            let (previous_scores, current_scores) = self.scores.adjacent_columns_mut(relative_j);
 
-            self.scores
-                .set(0, relative_j, j as f64 * Self::INSERTION_SCORE);
-            for i in 1..=self.old.len() {
-                let insertion_score = self.scores.get(i, relative_j - 1) + Self::INSERTION_SCORE;
-                let deletion_score = self.scores.get(i - 1, relative_j) + Self::DELETION_SCORE;
-                let equality_score = if self.old[i - 1] == self.new[j - 1] {
-                    let mut equal_run = self.equal_runs.get(&(i - 1, j - 1)).copied().unwrap_or(0);
-                    equal_run += 1;
-                    self.equal_runs.insert((i, j), equal_run);
+            current_scores[0] = j as f64 * Self::INSERTION_SCORE;
+            for i in 1..=old.len() {
+                let insertion_score = previous_scores[i] + Self::INSERTION_SCORE;
+                let deletion_score = current_scores[i - 1] + Self::DELETION_SCORE;
+                let equality_score = if old[i - 1] == new_char {
+                    let equal_run = previous_equal_runs[i - 1] + 1;
+                    current_equal_runs[i] = equal_run;
 
                     let exponent = cmp::min(equal_run as i32 / 4, Self::MAX_EQUALITY_EXPONENT);
-                    self.scores.get(i - 1, relative_j - 1) + Self::EQUALITY_BASE.powi(exponent)
+                    previous_scores[i - 1] + Self::EQUALITY_BASE.powi(exponent)
                 } else {
                     f64::NEG_INFINITY
                 };
 
-                let score = insertion_score.max(deletion_score).max(equality_score);
-                self.scores.set(i, relative_j, score);
+                current_scores[i] = insertion_score.max(deletion_score).max(equality_score);
             }
+
+            std::mem::swap(&mut self.previous_equal_runs, &mut self.current_equal_runs);
         }
 
         let mut max_score = f64::NEG_INFINITY;
@@ -503,12 +524,11 @@ fn is_line_end(point: Point, text: &Rope) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::BackgroundExecutor;
     use rand::prelude::*;
     use std::env;
 
-    #[gpui::test]
-    fn test_delete_first_of_two_lines(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_delete_first_of_two_lines() {
         let old_text = "aaaa\nbbbb";
         let char_ops = vec![
             CharOperation::Delete { bytes: 5 },
@@ -524,18 +544,18 @@ mod tests {
             apply_line_operations(old_text, &new_text, &expected_line_ops)
         );
 
-        let line_ops = char_ops_to_line_ops(old_text, &char_ops, cx.background_executor());
+        let line_ops = char_ops_to_line_ops(old_text, &char_ops);
         assert_eq!(line_ops, expected_line_ops);
     }
 
-    #[gpui::test]
-    fn test_delete_second_of_two_lines(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_delete_second_of_two_lines() {
         let old_text = "aaaa\nbbbb";
         let char_ops = vec![
             CharOperation::Keep { bytes: 5 },
             CharOperation::Delete { bytes: 4 },
         ];
-        let line_ops = char_ops_to_line_ops(old_text, &char_ops, cx.background_executor());
+        let line_ops = char_ops_to_line_ops(old_text, &char_ops);
         assert_eq!(
             line_ops,
             vec![
@@ -551,8 +571,8 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn test_add_new_line(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_add_new_line() {
         let old_text = "aaaa\nbbbb";
         let char_ops = vec![
             CharOperation::Keep { bytes: 9 },
@@ -560,7 +580,7 @@ mod tests {
                 text: "\ncccc".into(),
             },
         ];
-        let line_ops = char_ops_to_line_ops(old_text, &char_ops, cx.background_executor());
+        let line_ops = char_ops_to_line_ops(old_text, &char_ops);
         assert_eq!(
             line_ops,
             vec![
@@ -575,15 +595,15 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn test_delete_line_in_middle(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_delete_line_in_middle() {
         let old_text = "aaaa\nbbbb\ncccc";
         let char_ops = vec![
             CharOperation::Keep { bytes: 5 },
             CharOperation::Delete { bytes: 5 },
             CharOperation::Keep { bytes: 4 },
         ];
-        let line_ops = char_ops_to_line_ops(old_text, &char_ops, cx.background_executor());
+        let line_ops = char_ops_to_line_ops(old_text, &char_ops);
         assert_eq!(
             line_ops,
             vec![
@@ -599,8 +619,8 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn test_replace_line(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_replace_line() {
         let old_text = "aaaa\nbbbb\ncccc";
         let char_ops = vec![
             CharOperation::Keep { bytes: 5 },
@@ -610,7 +630,7 @@ mod tests {
             },
             CharOperation::Keep { bytes: 5 },
         ];
-        let line_ops = char_ops_to_line_ops(old_text, &char_ops, cx.background_executor());
+        let line_ops = char_ops_to_line_ops(old_text, &char_ops);
         assert_eq!(
             line_ops,
             vec![
@@ -627,8 +647,8 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn test_multiple_edits_on_different_lines(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_multiple_edits_on_different_lines() {
         let old_text = "aaaa\nbbbb\ncccc\ndddd";
         let char_ops = vec![
             CharOperation::Insert { text: "A".into() },
@@ -639,7 +659,7 @@ mod tests {
                 text: "\nEEEE".into(),
             },
         ];
-        let line_ops = char_ops_to_line_ops(old_text, &char_ops, cx.background_executor());
+        let line_ops = char_ops_to_line_ops(old_text, &char_ops);
         assert_eq!(
             line_ops,
             vec![
@@ -657,15 +677,15 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn test_edit_at_end_of_line(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_edit_at_end_of_line() {
         let old_text = "aaaa\nbbbb\ncccc";
         let char_ops = vec![
             CharOperation::Keep { bytes: 4 },
             CharOperation::Insert { text: "A".into() },
             CharOperation::Keep { bytes: 10 },
         ];
-        let line_ops = char_ops_to_line_ops(old_text, &char_ops, cx.background_executor());
+        let line_ops = char_ops_to_line_ops(old_text, &char_ops);
         assert_eq!(
             line_ops,
             vec![
@@ -681,8 +701,8 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn test_insert_newline_character(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_insert_newline_character() {
         let old_text = "aaaabbbb";
         let char_ops = vec![
             CharOperation::Keep { bytes: 4 },
@@ -690,7 +710,7 @@ mod tests {
             CharOperation::Keep { bytes: 4 },
         ];
         let new_text = apply_char_operations(old_text, &char_ops);
-        let line_ops = char_ops_to_line_ops(old_text, &char_ops, cx.background_executor());
+        let line_ops = char_ops_to_line_ops(old_text, &char_ops);
         assert_eq!(
             line_ops,
             vec![
@@ -704,14 +724,14 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn test_insert_newline_at_beginning(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_insert_newline_at_beginning() {
         let old_text = "aaaa\nbbbb";
         let char_ops = vec![
             CharOperation::Insert { text: "\n".into() },
             CharOperation::Keep { bytes: 9 },
         ];
-        let line_ops = char_ops_to_line_ops(old_text, &char_ops, cx.background_executor());
+        let line_ops = char_ops_to_line_ops(old_text, &char_ops);
         assert_eq!(
             line_ops,
             vec![
@@ -726,15 +746,15 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn test_delete_newline(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_delete_newline() {
         let old_text = "aaaa\nbbbb";
         let char_ops = vec![
             CharOperation::Keep { bytes: 4 },
             CharOperation::Delete { bytes: 1 },
             CharOperation::Keep { bytes: 4 },
         ];
-        let line_ops = char_ops_to_line_ops(old_text, &char_ops, cx.background_executor());
+        let line_ops = char_ops_to_line_ops(old_text, &char_ops);
         assert_eq!(
             line_ops,
             vec![
@@ -750,8 +770,8 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn test_insert_multiple_newlines(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_insert_multiple_newlines() {
         let old_text = "aaaa\nbbbb";
         let char_ops = vec![
             CharOperation::Keep { bytes: 5 },
@@ -760,7 +780,7 @@ mod tests {
             },
             CharOperation::Keep { bytes: 4 },
         ];
-        let line_ops = char_ops_to_line_ops(old_text, &char_ops, cx.background_executor());
+        let line_ops = char_ops_to_line_ops(old_text, &char_ops);
         assert_eq!(
             line_ops,
             vec![
@@ -776,15 +796,15 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn test_delete_multiple_newlines(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_delete_multiple_newlines() {
         let old_text = "aaaa\n\n\nbbbb";
         let char_ops = vec![
             CharOperation::Keep { bytes: 5 },
             CharOperation::Delete { bytes: 2 },
             CharOperation::Keep { bytes: 4 },
         ];
-        let line_ops = char_ops_to_line_ops(old_text, &char_ops, cx.background_executor());
+        let line_ops = char_ops_to_line_ops(old_text, &char_ops);
         assert_eq!(
             line_ops,
             vec![
@@ -800,8 +820,8 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn test_complex_scenario(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_complex_scenario() {
         let old_text = "line1\nline2\nline3\nline4";
         let char_ops = vec![
             CharOperation::Keep { bytes: 6 },
@@ -815,7 +835,7 @@ mod tests {
             },
             CharOperation::Keep { bytes: 6 },
         ];
-        let line_ops = char_ops_to_line_ops(old_text, &char_ops, cx.background_executor());
+        let line_ops = char_ops_to_line_ops(old_text, &char_ops);
         assert_eq!(
             line_ops,
             vec![
@@ -835,8 +855,8 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn test_cleaning_up_common_suffix(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_cleaning_up_common_suffix() {
         let old_text = concat!(
             "        for y in 0..size.y() {\n",
             "            let a = 10;\n",
@@ -884,7 +904,7 @@ mod tests {
             },
             CharOperation::Keep { bytes: 1 },
         ];
-        let line_ops = char_ops_to_line_ops(old_text, &char_ops, cx.background_executor());
+        let line_ops = char_ops_to_line_ops(old_text, &char_ops);
         assert_eq!(
             line_ops,
             vec![
@@ -902,8 +922,8 @@ mod tests {
         );
     }
 
-    #[gpui::test]
-    fn test_random_diffs(cx: &mut gpui::TestAppContext) {
+    #[test]
+    fn test_random_diffs() {
         random_test(|mut rng| {
             let old_text_len = env::var("OLD_TEXT_LEN")
                 .map(|i| i.parse().expect("invalid `OLD_TEXT_LEN` variable"))
@@ -923,19 +943,15 @@ mod tests {
             assert_eq!(patched, new);
 
             // Test char_ops_to_line_ops
-            let line_ops = char_ops_to_line_ops(&old, &char_operations, cx.background_executor());
+            let line_ops = char_ops_to_line_ops(&old, &char_operations);
             println!("line operations: {:?}", line_ops);
             let patched = apply_line_operations(&old, &new, &line_ops);
             assert_eq!(patched, new);
         });
     }
 
-    fn char_ops_to_line_ops(
-        old_text: &str,
-        char_ops: &[CharOperation],
-        executor: &BackgroundExecutor,
-    ) -> Vec<LineOperation> {
-        let old_rope = Rope::from_str(old_text, executor);
+    fn char_ops_to_line_ops(old_text: &str, char_ops: &[CharOperation]) -> Vec<LineOperation> {
+        let old_rope = Rope::from(old_text);
         let mut diff = LineDiff::default();
         for op in char_ops {
             diff.push_char_operation(op, &old_rope);

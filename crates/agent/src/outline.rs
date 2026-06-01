@@ -1,6 +1,6 @@
 use anyhow::Result;
 use gpui::{AsyncApp, Entity};
-use language::{Buffer, OutlineItem, ParseStatus};
+use language::{Buffer, OutlineItem};
 use regex::Regex;
 use std::fmt::Write;
 use text::Point;
@@ -11,10 +11,15 @@ pub const AUTO_OUTLINE_SIZE: usize = 16384;
 
 /// Result of getting buffer content, which can be either full content or an outline.
 pub struct BufferContent {
-    /// The actual content (either full text or outline)
+    /// The actual content (either full text, a symbol outline, or a
+    /// truncated fallback — see `is_synthetic`).
     pub text: String,
-    /// Whether this is an outline (true) or full content (false)
-    pub is_outline: bool,
+    /// `true` when `text` is not the file's full content — either a symbol
+    /// outline or the truncated first-1KB fallback used when no outline is
+    /// available. Callers that prefix line numbers to file content must
+    /// skip prefixing in this case, because line numbers in `text` would
+    /// not correspond to the file's real line numbers.
+    pub is_synthetic: bool,
 }
 
 /// Returns either the full content of a buffer or its outline, depending on size.
@@ -25,15 +30,14 @@ pub async fn get_buffer_content_or_outline(
     path: Option<&str>,
     cx: &AsyncApp,
 ) -> Result<BufferContent> {
-    let file_size = buffer.read_with(cx, |buffer, _| buffer.text().len())?;
+    let file_size = buffer.read_with(cx, |buffer, _| buffer.text().len());
 
     if file_size > AUTO_OUTLINE_SIZE {
         // For large files, use outline instead of full content
         // Wait until the buffer has been fully parsed, so we can read its outline
-        let mut parse_status = buffer.read_with(cx, |buffer, _| buffer.parse_status())?;
-        while *parse_status.borrow() != ParseStatus::Idle {
-            parse_status.changed().await?;
-        }
+        buffer
+            .read_with(cx, |buffer, _| buffer.parsing_idle())
+            .await;
 
         let outline_items = buffer.read_with(cx, |buffer, _| {
             let snapshot = buffer.snapshot();
@@ -43,27 +47,47 @@ pub async fn get_buffer_content_or_outline(
                 .into_iter()
                 .map(|item| item.to_point(&snapshot))
                 .collect::<Vec<_>>()
-        })?;
+        });
+
+        // If no outline exists, fall back to first 1KB so the agent has some context.
+        // This is reported as `is_synthetic: true` because the returned text is not
+        // the file's full content — it has a synthetic header and is truncated — so
+        // callers must not attach real-file line numbers to it.
+        if outline_items.is_empty() {
+            let text = buffer.read_with(cx, |buffer, _| {
+                let snapshot = buffer.snapshot();
+                let len = snapshot.len().min(snapshot.as_rope().floor_char_boundary(1024));
+                let content = snapshot.text_for_range(0..len).collect::<String>();
+                if let Some(path) = path {
+                    format!("# First 1KB of {path} (file too large to show full content, and no outline available)\n\n{content}")
+                } else {
+                    format!("# First 1KB of file (file too large to show full content, and no outline available)\n\n{content}")
+                }
+            });
+
+            return Ok(BufferContent {
+                text,
+                is_synthetic: true,
+            });
+        }
 
         let outline_text = render_outline(outline_items, None, 0, usize::MAX).await?;
 
         let text = if let Some(path) = path {
-            format!(
-                "# File outline for {path} (file too large to show full content)\n\n{outline_text}",
-            )
+            format!("# File outline for {path}\n\n{outline_text}",)
         } else {
-            format!("# File outline (file too large to show full content)\n\n{outline_text}",)
+            format!("# File outline\n\n{outline_text}",)
         };
         Ok(BufferContent {
             text,
-            is_outline: true,
+            is_synthetic: true,
         })
     } else {
         // File is small enough, return full content
-        let text = buffer.read_with(cx, |buffer, _| buffer.text())?;
+        let text = buffer.read_with(cx, |buffer, _| buffer.text());
         Ok(BufferContent {
             text,
-            is_outline: false,
+            is_synthetic: false,
         })
     }
 }
@@ -140,4 +164,66 @@ fn render_entries(
     }
 
     entries_rendered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use project::Project;
+    use settings::SettingsStore;
+
+    #[gpui::test]
+    async fn test_large_file_fallback_to_subset(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+
+        let content = "⚡".repeat(100 * 1024); // 100KB
+        let content_len = content.len();
+        let buffer = project
+            .update(cx, |project, cx| project.create_buffer(None, true, cx))
+            .await
+            .expect("failed to create buffer");
+
+        buffer.update(cx, |buffer, cx| buffer.set_text(content, cx));
+
+        let result = cx
+            .spawn(|cx| async move { get_buffer_content_or_outline(buffer, None, &cx).await })
+            .await
+            .unwrap();
+
+        // Should contain some of the actual file content
+        assert!(
+            result.text.contains("⚡⚡⚡⚡⚡⚡⚡"),
+            "Result did not contain content subset"
+        );
+
+        // Should be marked synthetic: the returned text is not the file's full
+        // content (it's a truncated first-1KB fallback with a synthetic header), so
+        // callers must treat it the same as the symbol-outline case and not attach
+        // real-file line numbers to it.
+        assert!(
+            result.is_synthetic,
+            "Truncated fallback should be reported as synthetic so callers skip line numbering"
+        );
+
+        // Should be reasonably sized (much smaller than original)
+        assert!(
+            result.text.len() < 50 * 1024,
+            "Result size {} should be smaller than 50KB",
+            result.text.len()
+        );
+
+        // Should be significantly smaller than the original content
+        assert!(
+            result.text.len() < content_len / 10,
+            "Result should be much smaller than original content"
+        );
+    }
 }

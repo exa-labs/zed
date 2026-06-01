@@ -1,3 +1,4 @@
+use agent_skills::SkillSummary;
 use anyhow::Result;
 use assets::Assets;
 use fs::Fs;
@@ -18,44 +19,69 @@ use util::{
     ResultExt, get_default_system_shell_preferring_bash, rel_path::RelPath, shell::ShellKind,
 };
 
-use crate::UserPromptId;
+pub const RULES_FILE_NAMES: &[&str] = &[
+    ".rules",
+    ".cursorrules",
+    ".windsurfrules",
+    ".clinerules",
+    ".github/copilot-instructions.md",
+    "AGENT.md",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "GEMINI.md",
+];
 
-#[derive(Default, Debug, Clone, Serialize)]
+#[derive(Default, Debug, Clone, Eq, PartialEq, Serialize)]
 pub struct ProjectContext {
     pub worktrees: Vec<WorktreeContext>,
     /// Whether any worktree has a rules_file. Provided as a field because handlebars can't do this.
     pub has_rules: bool,
-    pub user_rules: Vec<UserRulesContext>,
-    /// `!user_rules.is_empty()` - provided as a field because handlebars can't do this.
-    pub has_user_rules: bool,
     pub os: String,
     pub arch: String,
     pub shell: String,
+    // Similarly to `has_rules`, `has_skills` is a derived flag exposed
+    // to the handlebars template (which can't do
+    // `!skills.is_empty()`). These are `pub(crate)` so the only way to
+    // set them from outside is via `with_skills`, which keeps the two
+    // fields in sync.
+    pub(crate) skills: Vec<SkillSummary>,
+    pub(crate) has_skills: bool,
 }
 
 impl ProjectContext {
-    pub fn new(worktrees: Vec<WorktreeContext>, default_user_rules: Vec<UserRulesContext>) -> Self {
+    pub fn new(worktrees: Vec<WorktreeContext>) -> Self {
         let has_rules = worktrees
             .iter()
             .any(|worktree| worktree.rules_file.is_some());
         Self {
             worktrees,
             has_rules,
-            has_user_rules: !default_user_rules.is_empty(),
-            user_rules: default_user_rules,
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
             shell: ShellKind::new(&get_default_system_shell_preferring_bash(), cfg!(windows))
                 .to_string(),
+            skills: Vec::new(),
+            has_skills: false,
         }
     }
-}
 
-#[derive(Debug, Clone, Serialize)]
-pub struct UserRulesContext {
-    pub uuid: UserPromptId,
-    pub title: Option<String>,
-    pub contents: String,
+    // Hidden skills (`disable_model_invocation: true`) and any skills
+    // dropped to fit the catalog description budget are excluded
+    // upstream by `select_catalog_skills` in `agent.rs`, which already
+    // returns only catalog `SkillSummary` values.
+    pub fn with_skills(mut self, skills: Vec<SkillSummary>) -> Self {
+        self.has_skills = !skills.is_empty();
+        self.skills = skills;
+        self
+    }
+
+    pub fn skills(&self) -> &[SkillSummary] {
+        &self.skills
+    }
+
+    pub fn has_skills(&self) -> bool {
+        self.has_skills
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]
@@ -92,6 +118,58 @@ pub struct ContentPromptContext {
     pub user_prompt: String,
     pub rewrite_section: Option<String>,
     pub diagnostic_errors: Vec<ContentPromptDiagnosticContext>,
+}
+
+#[derive(Serialize)]
+pub struct ContentPromptContextV2 {
+    pub content_type: String,
+    pub language_name: Option<String>,
+    pub is_truncated: bool,
+    pub document_content: String,
+    pub rewrite_section: String,
+    pub diagnostic_errors: Vec<ContentPromptDiagnosticContext>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_skills::{Skill, SkillSource};
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_project_context_does_not_filter_by_budget() {
+        // The budget is enforced upstream in `agent.rs::select_catalog_skills`
+        // so that dropped skills can surface as load errors. ProjectContext
+        // should accept whatever summaries it's given.
+        let huge_description = "x".repeat(60 * 1024);
+        let skill = Skill {
+            name: "oversized".to_string(),
+            description: huge_description.clone(),
+            source: SkillSource::Global,
+            directory_path: PathBuf::from("/skills/oversized"),
+            skill_file_path: PathBuf::from("/skills/oversized/SKILL.md"),
+            disable_model_invocation: false,
+            embedded_body: None,
+        };
+        let summary = SkillSummary::from(&skill);
+
+        let context = ProjectContext::new(vec![]).with_skills(vec![summary]);
+        assert_eq!(context.skills.len(), 1);
+        assert_eq!(context.skills[0].description, huge_description);
+    }
+
+    #[test]
+    fn test_empty_skills_sets_has_skills_false() {
+        let context = ProjectContext::new(vec![]);
+        assert!(!context.has_skills);
+        assert!(context.skills.is_empty());
+    }
+
+    // Hidden-skill filtering used to live here, but it's now the
+    // responsibility of `select_catalog_skills` in `agent.rs`, which is the
+    // single source of truth for which skills enter the catalog.
+    // `ProjectContext::new` simply converts whatever skills it receives
+    // into summaries, so there's no behavior left to test at this layer.
 }
 
 #[derive(Serialize)]
@@ -274,6 +352,78 @@ impl PromptBuilder {
         }
 
         Ok(())
+    }
+
+    pub fn generate_inline_transformation_prompt_tools(
+        &self,
+        language_name: Option<&LanguageName>,
+        buffer: BufferSnapshot,
+        range: Range<usize>,
+    ) -> Result<String, RenderError> {
+        let content_type = match language_name.as_ref().map(|l| l.as_ref()) {
+            None | Some("Markdown" | "Plain Text") => "text",
+            Some(_) => "code",
+        };
+
+        const MAX_CTX: usize = 50000;
+        let mut is_truncated = false;
+
+        let before_range = 0..range.start;
+        let truncated_before = if before_range.len() > MAX_CTX {
+            is_truncated = true;
+            let start = buffer.clip_offset(range.start - MAX_CTX, text::Bias::Right);
+            start..range.start
+        } else {
+            before_range
+        };
+
+        let after_range = range.end..buffer.len();
+        let truncated_after = if after_range.len() > MAX_CTX {
+            is_truncated = true;
+            let end = buffer.clip_offset(range.end + MAX_CTX, text::Bias::Left);
+            range.end..end
+        } else {
+            after_range
+        };
+
+        let mut document_content = String::new();
+        for chunk in buffer.text_for_range(truncated_before) {
+            document_content.push_str(chunk);
+        }
+
+        document_content.push_str("<rewrite_this>\n");
+        for chunk in buffer.text_for_range(range.clone()) {
+            document_content.push_str(chunk);
+        }
+        document_content.push_str("\n</rewrite_this>");
+
+        for chunk in buffer.text_for_range(truncated_after) {
+            document_content.push_str(chunk);
+        }
+
+        let rewrite_section: String = buffer.text_for_range(range.clone()).collect();
+
+        let diagnostics = buffer.diagnostics_in_range::<_, Point>(range, false);
+        let diagnostic_errors: Vec<ContentPromptDiagnosticContext> = diagnostics
+            .map(|entry| {
+                let start = entry.range.start;
+                ContentPromptDiagnosticContext {
+                    line_number: (start.row + 1) as usize,
+                    error_message: entry.diagnostic.message.clone(),
+                    code_content: buffer.text_for_range(entry.range).collect(),
+                }
+            })
+            .collect();
+
+        let context = ContentPromptContextV2 {
+            content_type: content_type.to_string(),
+            language_name: language_name.map(|s| s.to_string()),
+            is_truncated,
+            document_content,
+            rewrite_section,
+            diagnostic_errors,
+        };
+        self.handlebars.lock().render("content_prompt_v2", &context)
     }
 
     pub fn generate_inline_transformation_prompt(

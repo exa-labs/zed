@@ -9,34 +9,47 @@ use std::{
 };
 
 #[cfg(test)]
-#[ctor::ctor]
+#[ctor::ctor(unsafe)]
 fn init_logger() {
     zlog::init_test();
 }
 
-#[gpui::test]
-fn test_edit(cx: &mut gpui::TestAppContext) {
-    let mut buffer = Buffer::new(
-        ReplicaId::LOCAL,
-        BufferId::new(1).unwrap(),
-        "abc",
-        cx.background_executor(),
-    );
+#[test]
+fn test_edit() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "abc");
     assert_eq!(buffer.text(), "abc");
-    buffer.edit([(3..3, "def")], cx.background_executor());
+    buffer.edit([(3..3, "def")]);
     assert_eq!(buffer.text(), "abcdef");
-    buffer.edit([(0..0, "ghi")], cx.background_executor());
+    buffer.edit([(0..0, "ghi")]);
     assert_eq!(buffer.text(), "ghiabcdef");
-    buffer.edit([(5..5, "jkl")], cx.background_executor());
+    buffer.edit([(5..5, "jkl")]);
     assert_eq!(buffer.text(), "ghiabjklcdef");
-    buffer.edit([(6..7, "")], cx.background_executor());
+    buffer.edit([(6..7, "")]);
     assert_eq!(buffer.text(), "ghiabjlcdef");
-    buffer.edit([(4..9, "mno")], cx.background_executor());
+    buffer.edit([(4..9, "mno")]);
     assert_eq!(buffer.text(), "ghiamnoef");
 }
 
+#[test]
+fn test_point_for_row_and_column_from_external_source() {
+    let buffer = Buffer::new(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        "aéøbcdef\nsecond",
+    );
+    let snapshot = buffer.snapshot();
+
+    assert_eq!(snapshot.point_from_external_input(0, 0), Point::new(0, 0));
+    assert_eq!(snapshot.point_from_external_input(0, 4), Point::new(0, 6));
+    assert_eq!(
+        snapshot.point_from_external_input(0, 100),
+        Point::new(0, 10)
+    );
+    assert_eq!(snapshot.point_from_external_input(1, 3), Point::new(1, 3));
+}
+
 #[gpui::test(iterations = 100)]
-fn test_random_edits(cx: &mut gpui::TestAppContext, mut rng: StdRng) {
+fn test_random_edits(mut rng: StdRng) {
     let operations = env::var("OPERATIONS")
         .map(|i| i.parse().expect("invalid `OPERATIONS` variable"))
         .unwrap_or(10);
@@ -49,7 +62,6 @@ fn test_random_edits(cx: &mut gpui::TestAppContext, mut rng: StdRng) {
         ReplicaId::LOCAL,
         BufferId::new(1).unwrap(),
         reference_string.clone(),
-        cx.background_executor(),
     );
     LineEnding::normalize(&mut reference_string);
 
@@ -62,7 +74,7 @@ fn test_random_edits(cx: &mut gpui::TestAppContext, mut rng: StdRng) {
     );
 
     for _i in 0..operations {
-        let (edits, _) = buffer.randomly_edit(&mut rng, 5, cx.background_executor());
+        let (edits, _) = buffer.randomly_edit(&mut rng, 5);
         for (old_range, new_text) in edits.iter().rev() {
             reference_string.replace_range(old_range.clone(), new_text);
         }
@@ -112,11 +124,7 @@ fn test_random_edits(cx: &mut gpui::TestAppContext, mut rng: StdRng) {
         let mut text = old_buffer.visible_text.clone();
         for edit in edits {
             let new_text: String = buffer.text_for_range(edit.new.clone()).collect();
-            text.replace(
-                edit.new.start..edit.new.start + edit.old.len(),
-                &new_text,
-                cx.background_executor(),
-            );
+            text.replace(edit.new.start..edit.new.start + edit.old.len(), &new_text);
         }
         assert_eq!(text.to_string(), buffer.text());
 
@@ -171,18 +179,14 @@ fn test_random_edits(cx: &mut gpui::TestAppContext, mut rng: StdRng) {
         let mut text = old_buffer.visible_text.clone();
         for edit in subscription_edits.into_inner() {
             let new_text: String = buffer.text_for_range(edit.new.clone()).collect();
-            text.replace(
-                edit.new.start..edit.new.start + edit.old.len(),
-                &new_text,
-                cx.background_executor(),
-            );
+            text.replace(edit.new.start..edit.new.start + edit.old.len(), &new_text);
         }
         assert_eq!(text.to_string(), buffer.text());
     }
 }
 
-#[gpui::test]
-fn test_line_endings(cx: &mut gpui::TestAppContext) {
+#[test]
+fn test_line_endings() {
     assert_eq!(LineEnding::detect(&"🍐✅\n".repeat(1000)), LineEnding::Unix);
     assert_eq!(LineEnding::detect(&"abcd\n".repeat(1000)), LineEnding::Unix);
     assert_eq!(
@@ -198,34 +202,25 @@ fn test_line_endings(cx: &mut gpui::TestAppContext) {
         ReplicaId::LOCAL,
         BufferId::new(1).unwrap(),
         "one\r\ntwo\rthree",
-        cx.background_executor(),
     );
     assert_eq!(buffer.text(), "one\ntwo\nthree");
     assert_eq!(buffer.line_ending(), LineEnding::Windows);
     buffer.check_invariants();
 
-    buffer.edit(
-        [(buffer.len()..buffer.len(), "\r\nfour")],
-        cx.background_executor(),
-    );
-    buffer.edit([(0..0, "zero\r\n")], cx.background_executor());
+    buffer.edit([(buffer.len()..buffer.len(), "\r\nfour")]);
+    buffer.edit([(0..0, "zero\r\n")]);
     assert_eq!(buffer.text(), "zero\none\ntwo\nthree\nfour");
     assert_eq!(buffer.line_ending(), LineEnding::Windows);
     buffer.check_invariants();
 }
 
-#[gpui::test]
-fn test_line_len(cx: &mut gpui::TestAppContext) {
-    let mut buffer = Buffer::new(
-        ReplicaId::LOCAL,
-        BufferId::new(1).unwrap(),
-        "",
-        cx.background_executor(),
-    );
-    buffer.edit([(0..0, "abcd\nefg\nhij")], cx.background_executor());
-    buffer.edit([(12..12, "kl\nmno")], cx.background_executor());
-    buffer.edit([(18..18, "\npqrs\n")], cx.background_executor());
-    buffer.edit([(18..21, "\nPQ")], cx.background_executor());
+#[test]
+fn test_line_len() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "");
+    buffer.edit([(0..0, "abcd\nefg\nhij")]);
+    buffer.edit([(12..12, "kl\nmno")]);
+    buffer.edit([(18..18, "\npqrs\n")]);
+    buffer.edit([(18..21, "\nPQ")]);
 
     assert_eq!(buffer.line_len(0), 4);
     assert_eq!(buffer.line_len(1), 3);
@@ -235,15 +230,10 @@ fn test_line_len(cx: &mut gpui::TestAppContext) {
     assert_eq!(buffer.line_len(5), 0);
 }
 
-#[gpui::test]
-fn test_common_prefix_at_position(cx: &mut gpui::TestAppContext) {
+#[test]
+fn test_common_prefix_at_position() {
     let text = "a = str; b = δα";
-    let buffer = Buffer::new(
-        ReplicaId::LOCAL,
-        BufferId::new(1).unwrap(),
-        text,
-        cx.background_executor(),
-    );
+    let buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), text);
 
     let offset1 = offset_after(text, "str");
     let offset2 = offset_after(text, "δα");
@@ -289,13 +279,12 @@ fn test_common_prefix_at_position(cx: &mut gpui::TestAppContext) {
     }
 }
 
-#[gpui::test]
-fn test_text_summary_for_range(cx: &mut gpui::TestAppContext) {
+#[test]
+fn test_text_summary_for_range() {
     let buffer = Buffer::new(
         ReplicaId::LOCAL,
         BufferId::new(1).unwrap(),
         "ab\nefg\nhklm\nnopqrs\ntuvwxyz",
-        cx.background_executor(),
     );
     assert_eq!(
         buffer.text_summary_for_range::<TextSummary, _>(0..2),
@@ -383,18 +372,13 @@ fn test_text_summary_for_range(cx: &mut gpui::TestAppContext) {
     );
 }
 
-#[gpui::test]
-fn test_chars_at(cx: &mut gpui::TestAppContext) {
-    let mut buffer = Buffer::new(
-        ReplicaId::LOCAL,
-        BufferId::new(1).unwrap(),
-        "",
-        cx.background_executor(),
-    );
-    buffer.edit([(0..0, "abcd\nefgh\nij")], cx.background_executor());
-    buffer.edit([(12..12, "kl\nmno")], cx.background_executor());
-    buffer.edit([(18..18, "\npqrs")], cx.background_executor());
-    buffer.edit([(18..21, "\nPQ")], cx.background_executor());
+#[test]
+fn test_chars_at() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "");
+    buffer.edit([(0..0, "abcd\nefgh\nij")]);
+    buffer.edit([(12..12, "kl\nmno")]);
+    buffer.edit([(18..18, "\npqrs")]);
+    buffer.edit([(18..21, "\nPQ")]);
 
     let chars = buffer.chars_at(Point::new(0, 0));
     assert_eq!(chars.collect::<String>(), "abcd\nefgh\nijkl\nmno\nPQrs");
@@ -412,53 +396,43 @@ fn test_chars_at(cx: &mut gpui::TestAppContext) {
     assert_eq!(chars.collect::<String>(), "PQrs");
 
     // Regression test:
-    let mut buffer = Buffer::new(
-        ReplicaId::LOCAL,
-        BufferId::new(1).unwrap(),
-        "",
-        cx.background_executor(),
-    );
-    buffer.edit([(0..0, "[workspace]\nmembers = [\n    \"xray_core\",\n    \"xray_server\",\n    \"xray_cli\",\n    \"xray_wasm\",\n]\n")], cx.background_executor());
-    buffer.edit([(60..60, "\n")], cx.background_executor());
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "");
+    buffer.edit([(0..0, "[workspace]\nmembers = [\n    \"xray_core\",\n    \"xray_server\",\n    \"xray_cli\",\n    \"xray_wasm\",\n]\n")]);
+    buffer.edit([(60..60, "\n")]);
 
     let chars = buffer.chars_at(Point::new(6, 0));
     assert_eq!(chars.collect::<String>(), "    \"xray_wasm\",\n]\n");
 }
 
-#[gpui::test]
-fn test_anchors(cx: &mut gpui::TestAppContext) {
-    let mut buffer = Buffer::new(
-        ReplicaId::LOCAL,
-        BufferId::new(1).unwrap(),
-        "",
-        cx.background_executor(),
-    );
-    buffer.edit([(0..0, "abc")], cx.background_executor());
+#[test]
+fn test_anchors() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "");
+    buffer.edit([(0..0, "abc")]);
     let left_anchor = buffer.anchor_before(2);
     let right_anchor = buffer.anchor_after(2);
 
-    buffer.edit([(1..1, "def\n")], cx.background_executor());
+    buffer.edit([(1..1, "def\n")]);
     assert_eq!(buffer.text(), "adef\nbc");
     assert_eq!(left_anchor.to_offset(&buffer), 6);
     assert_eq!(right_anchor.to_offset(&buffer), 6);
     assert_eq!(left_anchor.to_point(&buffer), Point { row: 1, column: 1 });
     assert_eq!(right_anchor.to_point(&buffer), Point { row: 1, column: 1 });
 
-    buffer.edit([(2..3, "")], cx.background_executor());
+    buffer.edit([(2..3, "")]);
     assert_eq!(buffer.text(), "adf\nbc");
     assert_eq!(left_anchor.to_offset(&buffer), 5);
     assert_eq!(right_anchor.to_offset(&buffer), 5);
     assert_eq!(left_anchor.to_point(&buffer), Point { row: 1, column: 1 });
     assert_eq!(right_anchor.to_point(&buffer), Point { row: 1, column: 1 });
 
-    buffer.edit([(5..5, "ghi\n")], cx.background_executor());
+    buffer.edit([(5..5, "ghi\n")]);
     assert_eq!(buffer.text(), "adf\nbghi\nc");
     assert_eq!(left_anchor.to_offset(&buffer), 5);
     assert_eq!(right_anchor.to_offset(&buffer), 9);
     assert_eq!(left_anchor.to_point(&buffer), Point { row: 1, column: 1 });
     assert_eq!(right_anchor.to_point(&buffer), Point { row: 2, column: 0 });
 
-    buffer.edit([(7..9, "")], cx.background_executor());
+    buffer.edit([(7..9, "")]);
     assert_eq!(buffer.text(), "adf\nbghc");
     assert_eq!(left_anchor.to_offset(&buffer), 5);
     assert_eq!(right_anchor.to_offset(&buffer), 7);
@@ -548,18 +522,13 @@ fn test_anchors(cx: &mut gpui::TestAppContext) {
     );
 }
 
-#[gpui::test]
-fn test_anchors_at_start_and_end(cx: &mut gpui::TestAppContext) {
-    let mut buffer = Buffer::new(
-        ReplicaId::LOCAL,
-        BufferId::new(1).unwrap(),
-        "",
-        cx.background_executor(),
-    );
+#[test]
+fn test_anchors_at_start_and_end() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "");
     let before_start_anchor = buffer.anchor_before(0);
     let after_end_anchor = buffer.anchor_after(0);
 
-    buffer.edit([(0..0, "abc")], cx.background_executor());
+    buffer.edit([(0..0, "abc")]);
     assert_eq!(buffer.text(), "abc");
     assert_eq!(before_start_anchor.to_offset(&buffer), 0);
     assert_eq!(after_end_anchor.to_offset(&buffer), 3);
@@ -567,8 +536,8 @@ fn test_anchors_at_start_and_end(cx: &mut gpui::TestAppContext) {
     let after_start_anchor = buffer.anchor_after(0);
     let before_end_anchor = buffer.anchor_before(3);
 
-    buffer.edit([(3..3, "def")], cx.background_executor());
-    buffer.edit([(0..0, "ghi")], cx.background_executor());
+    buffer.edit([(3..3, "def")]);
+    buffer.edit([(0..0, "ghi")]);
     assert_eq!(buffer.text(), "ghiabcdef");
     assert_eq!(before_start_anchor.to_offset(&buffer), 0);
     assert_eq!(after_start_anchor.to_offset(&buffer), 3);
@@ -576,20 +545,15 @@ fn test_anchors_at_start_and_end(cx: &mut gpui::TestAppContext) {
     assert_eq!(after_end_anchor.to_offset(&buffer), 9);
 }
 
-#[gpui::test]
-fn test_undo_redo(cx: &mut gpui::TestAppContext) {
-    let mut buffer = Buffer::new(
-        ReplicaId::LOCAL,
-        BufferId::new(1).unwrap(),
-        "1234",
-        cx.background_executor(),
-    );
+#[test]
+fn test_undo_redo() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "1234");
     // Set group interval to zero so as to not group edits in the undo stack.
     buffer.set_group_interval(Duration::from_secs(0));
 
-    buffer.edit([(1..1, "abx")], cx.background_executor());
-    buffer.edit([(3..4, "yzef")], cx.background_executor());
-    buffer.edit([(3..5, "cd")], cx.background_executor());
+    buffer.edit([(1..1, "abx")]);
+    buffer.edit([(3..4, "yzef")]);
+    buffer.edit([(3..5, "cd")]);
     assert_eq!(buffer.text(), "1abcdef234");
 
     let entries = buffer.history.undo_stack.clone();
@@ -617,31 +581,26 @@ fn test_undo_redo(cx: &mut gpui::TestAppContext) {
     assert_eq!(buffer.text(), "1234");
 }
 
-#[gpui::test]
-fn test_history(cx: &mut gpui::TestAppContext) {
+#[test]
+fn test_history() {
     let mut now = Instant::now();
-    let mut buffer = Buffer::new(
-        ReplicaId::LOCAL,
-        BufferId::new(1).unwrap(),
-        "123456",
-        cx.background_executor(),
-    );
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "123456");
     buffer.set_group_interval(Duration::from_millis(300));
 
     let transaction_1 = buffer.start_transaction_at(now).unwrap();
-    buffer.edit([(2..4, "cd")], cx.background_executor());
+    buffer.edit([(2..4, "cd")]);
     buffer.end_transaction_at(now);
     assert_eq!(buffer.text(), "12cd56");
 
     buffer.start_transaction_at(now);
-    buffer.edit([(4..5, "e")], cx.background_executor());
+    buffer.edit([(4..5, "e")]);
     buffer.end_transaction_at(now).unwrap();
     assert_eq!(buffer.text(), "12cde6");
 
     now += buffer.transaction_group_interval() + Duration::from_millis(1);
     buffer.start_transaction_at(now);
-    buffer.edit([(0..1, "a")], cx.background_executor());
-    buffer.edit([(1..1, "b")], cx.background_executor());
+    buffer.edit([(0..1, "a")]);
+    buffer.edit([(1..1, "b")]);
     buffer.end_transaction_at(now).unwrap();
     assert_eq!(buffer.text(), "ab2cde6");
 
@@ -668,7 +627,7 @@ fn test_history(cx: &mut gpui::TestAppContext) {
 
     // Redo stack gets cleared after performing an edit.
     buffer.start_transaction_at(now);
-    buffer.edit([(0..0, "X")], cx.background_executor());
+    buffer.edit([(0..0, "X")]);
     buffer.end_transaction_at(now);
     assert_eq!(buffer.text(), "X12cde6");
     buffer.redo();
@@ -689,31 +648,26 @@ fn test_history(cx: &mut gpui::TestAppContext) {
     assert_eq!(buffer.text(), "X12cde6");
 }
 
-#[gpui::test]
-fn test_finalize_last_transaction(cx: &mut gpui::TestAppContext) {
+#[test]
+fn test_finalize_last_transaction() {
     let now = Instant::now();
-    let mut buffer = Buffer::new(
-        ReplicaId::LOCAL,
-        BufferId::new(1).unwrap(),
-        "123456",
-        cx.background_executor(),
-    );
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "123456");
     buffer.history.group_interval = Duration::from_millis(1);
 
     buffer.start_transaction_at(now);
-    buffer.edit([(2..4, "cd")], cx.background_executor());
+    buffer.edit([(2..4, "cd")]);
     buffer.end_transaction_at(now);
     assert_eq!(buffer.text(), "12cd56");
 
     buffer.finalize_last_transaction();
     buffer.start_transaction_at(now);
-    buffer.edit([(4..5, "e")], cx.background_executor());
+    buffer.edit([(4..5, "e")]);
     buffer.end_transaction_at(now).unwrap();
     assert_eq!(buffer.text(), "12cde6");
 
     buffer.start_transaction_at(now);
-    buffer.edit([(0..1, "a")], cx.background_executor());
-    buffer.edit([(1..1, "b")], cx.background_executor());
+    buffer.edit([(0..1, "a")]);
+    buffer.edit([(1..1, "b")]);
     buffer.end_transaction_at(now).unwrap();
     assert_eq!(buffer.text(), "ab2cde6");
 
@@ -730,19 +684,14 @@ fn test_finalize_last_transaction(cx: &mut gpui::TestAppContext) {
     assert_eq!(buffer.text(), "ab2cde6");
 }
 
-#[gpui::test]
-fn test_edited_ranges_for_transaction(cx: &mut gpui::TestAppContext) {
+#[test]
+fn test_edited_ranges_for_transaction() {
     let now = Instant::now();
-    let mut buffer = Buffer::new(
-        ReplicaId::LOCAL,
-        BufferId::new(1).unwrap(),
-        "1234567",
-        cx.background_executor(),
-    );
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "1234567");
 
     buffer.start_transaction_at(now);
-    buffer.edit([(2..4, "cd")], cx.background_executor());
-    buffer.edit([(6..6, "efg")], cx.background_executor());
+    buffer.edit([(2..4, "cd")]);
+    buffer.edit([(6..6, "efg")]);
     buffer.end_transaction_at(now);
     assert_eq!(buffer.text(), "12cd56efg7");
 
@@ -754,7 +703,7 @@ fn test_edited_ranges_for_transaction(cx: &mut gpui::TestAppContext) {
         [2..4, 6..9]
     );
 
-    buffer.edit([(5..5, "hijk")], cx.background_executor());
+    buffer.edit([(5..5, "hijk")]);
     assert_eq!(buffer.text(), "12cd5hijk6efg7");
     assert_eq!(
         buffer
@@ -763,7 +712,7 @@ fn test_edited_ranges_for_transaction(cx: &mut gpui::TestAppContext) {
         [2..4, 10..13]
     );
 
-    buffer.edit([(4..4, "l")], cx.background_executor());
+    buffer.edit([(4..4, "l")]);
     assert_eq!(buffer.text(), "12cdl5hijk6efg7");
     assert_eq!(
         buffer
@@ -773,50 +722,77 @@ fn test_edited_ranges_for_transaction(cx: &mut gpui::TestAppContext) {
     );
 }
 
-#[gpui::test]
-fn test_concurrent_edits(cx: &mut gpui::TestAppContext) {
+#[test]
+fn test_concurrent_edits() {
     let text = "abcdef";
 
-    let mut buffer1 = Buffer::new(
-        ReplicaId::new(1),
-        BufferId::new(1).unwrap(),
-        text,
-        cx.background_executor(),
-    );
-    let mut buffer2 = Buffer::new(
-        ReplicaId::new(2),
-        BufferId::new(1).unwrap(),
-        text,
-        cx.background_executor(),
-    );
-    let mut buffer3 = Buffer::new(
-        ReplicaId::new(3),
-        BufferId::new(1).unwrap(),
-        text,
-        cx.background_executor(),
-    );
+    let mut buffer1 = Buffer::new(ReplicaId::new(1), BufferId::new(1).unwrap(), text);
+    let mut buffer2 = Buffer::new(ReplicaId::new(2), BufferId::new(1).unwrap(), text);
+    let mut buffer3 = Buffer::new(ReplicaId::new(3), BufferId::new(1).unwrap(), text);
 
-    let buf1_op = buffer1.edit([(1..2, "12")], cx.background_executor());
+    let buf1_op = buffer1.edit([(1..2, "12")]);
     assert_eq!(buffer1.text(), "a12cdef");
-    let buf2_op = buffer2.edit([(3..4, "34")], cx.background_executor());
+    let buf2_op = buffer2.edit([(3..4, "34")]);
     assert_eq!(buffer2.text(), "abc34ef");
-    let buf3_op = buffer3.edit([(5..6, "56")], cx.background_executor());
+    let buf3_op = buffer3.edit([(5..6, "56")]);
     assert_eq!(buffer3.text(), "abcde56");
 
-    buffer1.apply_op(buf2_op.clone(), Some(cx.background_executor()));
-    buffer1.apply_op(buf3_op.clone(), Some(cx.background_executor()));
-    buffer2.apply_op(buf1_op.clone(), Some(cx.background_executor()));
-    buffer2.apply_op(buf3_op, Some(cx.background_executor()));
-    buffer3.apply_op(buf1_op, Some(cx.background_executor()));
-    buffer3.apply_op(buf2_op, Some(cx.background_executor()));
+    buffer1.apply_op(buf2_op.clone());
+    buffer1.apply_op(buf3_op.clone());
+    buffer2.apply_op(buf1_op.clone());
+    buffer2.apply_op(buf3_op);
+    buffer3.apply_op(buf1_op);
+    buffer3.apply_op(buf2_op);
 
     assert_eq!(buffer1.text(), "a12c34e56");
     assert_eq!(buffer2.text(), "a12c34e56");
     assert_eq!(buffer3.text(), "a12c34e56");
 }
 
+// Regression test: applying a remote edit whose FullOffset range partially
+// overlaps a fragment that was already deleted (observed but not visible)
+// used to leave the fragment unsplit, causing the rope builder to read past
+// the end of the rope.
+#[test]
+fn test_edit_partially_intersecting_a_deleted_fragment() {
+    let mut buffer = Buffer::new(ReplicaId::new(1), BufferId::new(1).unwrap(), "abcdefgh");
+
+    // Delete "cde", creating a single deleted fragment at FullOffset 2..5.
+    // After this the fragment layout is:
+    //   "ab"(vis, FullOffset 0..2)  "cde"(del, 2..5)  "fgh"(vis, 5..8)
+    buffer.edit([(2..5, "")]);
+    assert_eq!(buffer.text(), "abfgh");
+
+    // Construct a synthetic remote edit whose version includes the deletion (so
+    // the "cde" fragment is observed + deleted → !was_visible) but whose
+    // FullOffset range only partially overlaps it. This state arises in
+    // production when concurrent edits cause different fragment splits on
+    // different replicas.
+    let synthetic_timestamp = clock::Lamport {
+        replica_id: ReplicaId::new(2),
+        value: 10,
+    };
+    let synthetic_edit = Operation::Edit(EditOperation {
+        timestamp: synthetic_timestamp,
+        version: buffer.version(),
+        // Range 1..4 partially overlaps the deleted "cde" (FullOffset 2..5):
+        // it covers "b" (1..2) and only "cd" (2..4), leaving "e" (4..5) out.
+        ranges: vec![FullOffset(1)..FullOffset(4)],
+        new_text: vec!["".into()],
+    });
+
+    // Without the fix this panics with "cannot summarize past end of rope"
+    // because the full 3-byte "cde" fragment is consumed from the deleted
+    // rope instead of only the 2-byte intersection.
+    buffer.apply_ops([synthetic_edit]);
+    assert_eq!(buffer.text(), "afgh");
+
+    buffer.undo_operations([(synthetic_timestamp, u32::MAX)].into_iter().collect());
+    assert_eq!(buffer.text(), "abfgh");
+}
+
 #[gpui::test(iterations = 100)]
-fn test_random_concurrent_edits(mut rng: StdRng, cx: &mut gpui::TestAppContext) {
+fn test_random_concurrent_edits(mut rng: StdRng) {
     let peers = env::var("PEERS")
         .map(|i| i.parse().expect("invalid `PEERS` variable"))
         .unwrap_or(5);
@@ -837,7 +813,6 @@ fn test_random_concurrent_edits(mut rng: StdRng, cx: &mut gpui::TestAppContext) 
             ReplicaId::new(i as u16),
             BufferId::new(1).unwrap(),
             base_text.clone(),
-            cx.background_executor(),
         );
         buffer.history.group_interval = Duration::from_millis(rng.random_range(0..=200));
         buffers.push(buffer);
@@ -854,9 +829,7 @@ fn test_random_concurrent_edits(mut rng: StdRng, cx: &mut gpui::TestAppContext) 
         let buffer = &mut buffers[replica_index];
         match rng.random_range(0..=100) {
             0..=50 if mutation_count != 0 => {
-                let op = buffer
-                    .randomly_edit(&mut rng, 5, cx.background_executor())
-                    .1;
+                let op = buffer.randomly_edit(&mut rng, 5).1;
                 network.broadcast(buffer.replica_id, vec![op]);
                 log::info!("buffer {:?} text: {:?}", buffer.replica_id, buffer.text());
                 mutation_count -= 1;
@@ -874,7 +847,7 @@ fn test_random_concurrent_edits(mut rng: StdRng, cx: &mut gpui::TestAppContext) 
                         replica_id,
                         ops.len()
                     );
-                    buffer.apply_ops(ops, Some(cx.background_executor()));
+                    buffer.apply_ops(ops);
                 }
             }
             _ => {}
@@ -896,4 +869,189 @@ fn test_random_concurrent_edits(mut rng: StdRng, cx: &mut gpui::TestAppContext) 
         );
         buffer.check_invariants();
     }
+}
+
+#[test]
+fn test_new_normalized_splits_large_base_text() {
+    // ASCII text that exceeds max_insertion_len
+    let text = "abcdefghij".repeat(10); // 100 bytes
+    let rope = Rope::from(text.as_str());
+    let buffer = Buffer::new_normalized(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        LineEnding::Unix,
+        rope,
+    );
+    assert_eq!(buffer.text(), text);
+    buffer.check_invariants();
+
+    // Verify anchors at various positions, including across chunk boundaries
+    for offset in [0, 1, 15, 16, 17, 50, 99] {
+        let anchor = buffer.anchor_before(offset);
+        assert_eq!(
+            anchor.to_offset(&buffer),
+            offset,
+            "anchor_before({offset}) round-tripped incorrectly"
+        );
+        let anchor = buffer.anchor_after(offset);
+        assert_eq!(
+            anchor.to_offset(&buffer),
+            offset,
+            "anchor_after({offset}) round-tripped incorrectly"
+        );
+    }
+
+    // Verify editing works after a split initialization
+    let mut buffer = buffer;
+    buffer.edit([(50..60, "XYZ")]);
+    let mut expected = text;
+    expected.replace_range(50..60, "XYZ");
+    assert_eq!(buffer.text(), expected);
+    buffer.check_invariants();
+}
+
+#[test]
+fn test_new_normalized_splits_large_base_text_with_multibyte_chars() {
+    // Use multi-byte chars (é is 2 bytes in UTF-8) so that a naive byte-level
+    // split would land in the middle of a character.
+    let unit = "ééééééééé"; // 9 chars × 2 bytes = 18 bytes
+    let text = unit.repeat(6); // 108 bytes
+    let rope = Rope::from(text.as_str());
+    let buffer = Buffer::new_normalized(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        LineEnding::Unix,
+        rope,
+    );
+    assert_eq!(buffer.text(), text);
+    buffer.check_invariants();
+
+    // Every anchor should resolve correctly even though chunks had to be
+    // rounded down to a char boundary.
+    let snapshot = buffer.snapshot();
+    for offset in (0..text.len()).filter(|o| text.is_char_boundary(*o)) {
+        let anchor = snapshot.anchor_before(offset);
+        assert_eq!(
+            anchor.to_offset(snapshot),
+            offset,
+            "anchor round-trip failed at byte offset {offset}"
+        );
+    }
+}
+
+#[test]
+fn test_new_normalized_small_text_unchanged() {
+    // Text that fits in a single chunk should produce exactly one fragment,
+    // matching the original single-fragment behaviour.
+    let text = "hello world";
+    let rope = Rope::from(text);
+    let buffer = Buffer::new_normalized(
+        ReplicaId::LOCAL,
+        BufferId::new(1).unwrap(),
+        LineEnding::Unix,
+        rope,
+    );
+    assert_eq!(buffer.text(), text);
+    buffer.check_invariants();
+    assert_eq!(buffer.snapshot().fragments.items(&None).len(), 1);
+}
+
+#[test]
+fn test_edit_splits_large_insertion() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "abcdefghij");
+
+    let large_text: Arc<str> = "X".repeat(100).into();
+    let edits = vec![(3..7, large_text.clone())];
+
+    buffer.edit(edits);
+
+    let expected = format!("abc{}hij", large_text);
+    assert_eq!(buffer.text(), expected);
+    buffer.check_invariants();
+
+    // Anchors should resolve correctly throughout the buffer.
+    for offset in [0, 3, 50, 103, expected.len()] {
+        let anchor = buffer.anchor_before(offset);
+        assert_eq!(
+            anchor.to_offset(&buffer),
+            offset,
+            "anchor_before({offset}) round-tripped incorrectly"
+        );
+    }
+}
+
+#[test]
+fn test_edit_splits_large_insertion_with_multibyte_chars() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "abcdefghij");
+
+    // 4-byte chars so that naive byte splits would land mid-character.
+    let large_text: Arc<str> = "😀".repeat(30).into(); // 30 × 4 = 120 bytes
+    let edits = vec![(5..5, large_text.clone())];
+
+    buffer.edit(edits);
+
+    let expected = format!("abcde{}fghij", large_text);
+    assert_eq!(buffer.text(), expected);
+    buffer.check_invariants();
+}
+
+#[test]
+fn test_edit_splits_large_insertion_among_multiple_edits() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "ABCDEFGHIJ");
+
+    let large_text: Arc<str> = "x".repeat(60).into();
+    // Three edits: small, large, small. The large one must be split while
+    // preserving the correct positions of the surrounding edits.
+    let edits = vec![
+        (1..2, Arc::from("y")),     // replace "B" with "y"
+        (4..6, large_text.clone()), // replace "EF" with 60 x's
+        (9..9, Arc::from("z")),     // insert "z" before "J"
+    ];
+
+    buffer.edit(edits);
+
+    // Original: A B C D E F G H I J
+    // After (1..2, "y"):       A y C D E F G H I J
+    // After (4..6, large):     A y C D <60 x's> G H I J
+    // After (9..9, "z"):       A y C D <60 x's> G H I z J
+    let expected = format!("AyCD{}GHIzJ", large_text);
+    assert_eq!(buffer.text(), expected);
+    buffer.check_invariants();
+}
+
+#[test]
+fn test_edit_splits_multiple_large_insertions() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "ABCDE");
+
+    let text1: Arc<str> = "a".repeat(40).into();
+    let text2: Arc<str> = "b".repeat(40).into();
+    let edits = vec![
+        (1..2, text1.clone()), // replace "B" with 40 a's
+        (3..4, text2.clone()), // replace "D" with 40 b's
+    ];
+
+    buffer.edit(edits);
+
+    let expected = format!("A{}C{}E", text1, text2);
+    assert_eq!(buffer.text(), expected);
+    buffer.check_invariants();
+}
+
+#[test]
+fn test_edit_undo_after_split() {
+    let mut buffer = Buffer::new(ReplicaId::LOCAL, BufferId::new(1).unwrap(), "hello world");
+    buffer.set_group_interval(Duration::from_secs(0));
+    let original = buffer.text();
+
+    let large_text: Arc<str> = "Z".repeat(50).into();
+    let edits = vec![(5..6, large_text)];
+    buffer.edit(edits);
+    assert_ne!(buffer.text(), original);
+    buffer.check_invariants();
+
+    // Undo should restore the original text even though the edit was split
+    // into multiple internal operations grouped in one transaction.
+    buffer.undo();
+    assert_eq!(buffer.text(), original);
+    buffer.check_invariants();
 }

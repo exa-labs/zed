@@ -14,8 +14,12 @@ path = "src/streaming_diff.rs"
 [dependencies]
 ordered-float.workspace = true
 rope.workspace = true
-gpui.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 rand.workspace = true
 util = { workspace = true, features = ["test-support"] }
+
+[[bench]]
+name = "streaming_diff"
+harness = false

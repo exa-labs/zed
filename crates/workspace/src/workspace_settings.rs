@@ -1,15 +1,15 @@
-use std::num::NonZeroUsize;
+use std::{num::NonZeroUsize, time::Duration};
 
 use crate::DockPosition;
 use collections::HashMap;
 use serde::Deserialize;
-pub use settings::AutosaveSetting;
 pub use settings::{
-    BottomDockLayout, PaneSplitDirectionHorizontal, PaneSplitDirectionVertical,
-    RestoreOnStartupBehavior,
+    ActionName, AutosaveSetting, BottomDockLayout, EncodingDisplayOptions, InactiveOpacity,
+    PaneSplitDirectionHorizontal, PaneSplitDirectionVertical, RegisterSetting,
+    RestoreOnStartupBehavior, Settings,
 };
-use settings::{InactiveOpacity, Settings};
 
+#[derive(RegisterSetting)]
 pub struct WorkspaceSettings {
     pub active_pane_modifiers: ActivePanelModifiers,
     pub bottom_dock_layout: settings::BottomDockLayout,
@@ -20,18 +20,29 @@ pub struct WorkspaceSettings {
     pub show_call_status_icon: bool,
     pub autosave: AutosaveSetting,
     pub restore_on_startup: settings::RestoreOnStartupBehavior,
+    pub cli_default_open_behavior: settings::CliDefaultOpenBehavior,
     pub restore_on_file_reopen: bool,
     pub drop_target_size: f32,
     pub use_system_path_prompts: bool,
     pub use_system_prompts: bool,
-    pub command_aliases: HashMap<String, String>,
+    pub command_aliases: HashMap<String, ActionName>,
     pub max_tabs: Option<NonZeroUsize>,
     pub when_closing_with_no_tabs: settings::CloseWindowWhenNoItems,
     pub on_last_window_closed: settings::OnLastWindowClosed,
+    pub text_rendering_mode: settings::TextRenderingMode,
     pub resize_all_panels_in_dock: Vec<DockPosition>,
     pub close_on_file_delete: bool,
+    pub close_panel_on_toggle: bool,
     pub use_system_window_tabs: bool,
     pub zoomed_padding: bool,
+    pub window_decorations: settings::WindowDecorations,
+    pub focus_follows_mouse: FocusFollowsMouse,
+}
+
+#[derive(Copy, Clone, Deserialize)]
+pub struct FocusFollowsMouse {
+    pub enabled: bool,
+    pub debounce: Duration,
 }
 
 #[derive(Copy, Clone, PartialEq, Debug, Default)]
@@ -53,11 +64,12 @@ pub struct ActivePanelModifiers {
     pub inactive_opacity: Option<InactiveOpacity>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, RegisterSetting)]
 pub struct TabBarSettings {
     pub show: bool,
     pub show_nav_history_buttons: bool,
     pub show_tab_bar_buttons: bool,
+    pub show_pinned_tabs_in_separate_row: bool,
 }
 
 impl Settings for WorkspaceSettings {
@@ -88,6 +100,7 @@ impl Settings for WorkspaceSettings {
             show_call_status_icon: workspace.show_call_status_icon.unwrap(),
             autosave: workspace.autosave.unwrap(),
             restore_on_startup: workspace.restore_on_startup.unwrap(),
+            cli_default_open_behavior: workspace.cli_default_open_behavior.unwrap(),
             restore_on_file_reopen: workspace.restore_on_file_reopen.unwrap(),
             drop_target_size: workspace.drop_target_size.unwrap(),
             use_system_path_prompts: workspace.use_system_path_prompts.unwrap(),
@@ -96,6 +109,7 @@ impl Settings for WorkspaceSettings {
             max_tabs: workspace.max_tabs,
             when_closing_with_no_tabs: workspace.when_closing_with_no_tabs.unwrap(),
             on_last_window_closed: workspace.on_last_window_closed.unwrap(),
+            text_rendering_mode: workspace.text_rendering_mode.unwrap(),
             resize_all_panels_in_dock: workspace
                 .resize_all_panels_in_dock
                 .clone()
@@ -104,8 +118,24 @@ impl Settings for WorkspaceSettings {
                 .map(Into::into)
                 .collect(),
             close_on_file_delete: workspace.close_on_file_delete.unwrap(),
+            close_panel_on_toggle: workspace.close_panel_on_toggle.unwrap(),
             use_system_window_tabs: workspace.use_system_window_tabs.unwrap(),
             zoomed_padding: workspace.zoomed_padding.unwrap(),
+            window_decorations: workspace.window_decorations.unwrap(),
+            focus_follows_mouse: FocusFollowsMouse {
+                enabled: workspace
+                    .focus_follows_mouse
+                    .unwrap()
+                    .enabled
+                    .unwrap_or(false),
+                debounce: Duration::from_millis(
+                    workspace
+                        .focus_follows_mouse
+                        .unwrap()
+                        .debounce_ms
+                        .unwrap_or(250),
+                ),
+            },
         }
     }
 }
@@ -117,16 +147,19 @@ impl Settings for TabBarSettings {
             show: tab_bar.show.unwrap(),
             show_nav_history_buttons: tab_bar.show_nav_history_buttons.unwrap(),
             show_tab_bar_buttons: tab_bar.show_tab_bar_buttons.unwrap(),
+            show_pinned_tabs_in_separate_row: tab_bar.show_pinned_tabs_in_separate_row.unwrap(),
         }
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, RegisterSetting)]
 pub struct StatusBarSettings {
     pub show: bool,
+    pub show_active_file: bool,
     pub active_language_button: bool,
     pub cursor_position_button: bool,
     pub line_endings_button: bool,
+    pub active_encoding_button: EncodingDisplayOptions,
 }
 
 impl Settings for StatusBarSettings {
@@ -134,9 +167,11 @@ impl Settings for StatusBarSettings {
         let status_bar = content.status_bar.clone().unwrap();
         StatusBarSettings {
             show: status_bar.show.unwrap(),
+            show_active_file: status_bar.show_active_file.unwrap(),
             active_language_button: status_bar.active_language_button.unwrap(),
             cursor_position_button: status_bar.cursor_position_button.unwrap(),
             line_endings_button: status_bar.line_endings_button.unwrap(),
+            active_encoding_button: status_bar.active_encoding_button.unwrap(),
         }
     }
 }

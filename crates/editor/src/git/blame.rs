@@ -1,11 +1,11 @@
 use crate::Editor;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use collections::HashMap;
-use futures::StreamExt;
+
 use git::{
-    GitHostingProviderRegistry, GitRemote, Oid,
-    blame::{Blame, BlameEntry, ParsedCommitMessage},
-    parse_git_remote_url,
+    GitHostingProviderRegistry, Oid,
+    blame::{Blame, BlameEntry},
+    commit::ParsedCommitMessage,
 };
 use gpui::{
     AnyElement, App, AppContext as _, Context, Entity, Hsla, ScrollHandle, Subscription, Task,
@@ -67,7 +67,7 @@ impl<'a> sum_tree::Dimension<'a, GitBlameEntrySummary> for u32 {
 struct GitBlameBuffer {
     entries: SumTree<GitBlameEntry>,
     buffer_snapshot: BufferSnapshot,
-    buffer_edits: text::Subscription,
+    buffer_edits: text::Subscription<usize>,
     commit_details: HashMap<Oid, ParsedCommitMessage>,
 }
 
@@ -204,8 +204,8 @@ impl GitBlame {
                         git_blame.generate(cx);
                     }
                 }
-                multi_buffer::Event::ExcerptsAdded { .. }
-                | multi_buffer::Event::ExcerptsEdited { .. } => git_blame.regenerate_on_edit(cx),
+                multi_buffer::Event::BufferRangesUpdated { .. }
+                | multi_buffer::Event::BuffersEdited { .. } => git_blame.regenerate_on_edit(cx),
                 _ => {}
             },
         );
@@ -346,11 +346,10 @@ impl GitBlame {
         let Some(multi_buffer) = self.multi_buffer.upgrade() else {
             return;
         };
-        multi_buffer
-            .read(cx)
-            .excerpt_buffer_ids()
-            .into_iter()
-            .for_each(|id| self.sync(cx, id));
+        let snapshot = multi_buffer.read(cx).snapshot(cx);
+        for id in snapshot.all_buffer_ids() {
+            self.sync(cx, id)
+        }
     }
 
     fn sync(&mut self, cx: &mut App, buffer_id: BufferId) {
@@ -489,81 +488,122 @@ impl GitBlame {
         }
     }
 
+    #[ztracing::instrument(skip_all)]
     fn generate(&mut self, cx: &mut Context<Self>) {
         if !self.focused {
             self.changed_while_blurred = true;
             return;
         }
-        let blame = self.project.update(cx, |project, cx| {
-            let Some(multi_buffer) = self.multi_buffer.upgrade() else {
-                return Vec::new();
-            };
-            multi_buffer
-                .read(cx)
-                .all_buffer_ids()
-                .into_iter()
-                .filter_map(|id| {
-                    let buffer = multi_buffer.read(cx).buffer(id)?;
-                    let snapshot = buffer.read(cx).snapshot();
-                    let buffer_edits = buffer.update(cx, |buffer, _| buffer.subscribe());
-
-                    let blame_buffer = project.blame_buffer(&buffer, None, cx);
-                    Some(async move { (id, snapshot, buffer_edits, blame_buffer.await) })
-                })
-                .collect::<Vec<_>>()
-        });
-        let provider_registry = GitHostingProviderRegistry::default_global(cx);
+        let buffers_to_blame = self
+            .multi_buffer
+            .update(cx, |multi_buffer, cx| {
+                let snapshot = multi_buffer.snapshot(cx);
+                snapshot
+                    .all_buffer_ids()
+                    .filter_map(|id| Some(multi_buffer.buffer(id)?.downgrade()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let project = self.project.downgrade();
 
         self.task = cx.spawn(async move |this, cx| {
-            let (result, errors) = cx
-                .background_spawn({
-                    async move {
-                        let blame = futures::stream::iter(blame)
-                            .buffered(4)
-                            .collect::<Vec<_>>()
-                            .await;
-                        let mut res = vec![];
-                        let mut errors = vec![];
-                        for (id, snapshot, buffer_edits, blame) in blame {
-                            match blame {
-                                Ok(Some(Blame {
-                                    entries,
-                                    messages,
-                                    remote_url,
-                                })) => {
-                                    let entries = build_blame_entry_sum_tree(
-                                        entries,
-                                        snapshot.max_point().row,
-                                    );
-                                    let commit_details = parse_commit_messages(
-                                        messages,
-                                        remote_url,
-                                        provider_registry.clone(),
-                                    )
-                                    .await;
+            let mut all_results = Vec::new();
+            let mut all_errors = Vec::new();
 
-                                    res.push((
+            for buffers in buffers_to_blame.chunks(4) {
+                let span = ztracing::debug_span!("for each chunk of buffers");
+                let _enter = span.enter();
+                let blame = cx.update(|cx| {
+                    buffers
+                        .iter()
+                        .map(|buffer| {
+                            let buffer = buffer.upgrade().context("buffer was dropped")?;
+                            let project = project.upgrade().context("project was dropped")?;
+                            let id = buffer.read(cx).remote_id();
+                            let snapshot = buffer.read(cx).snapshot();
+                            let buffer_edits = buffer.update(cx, |buffer, _| buffer.subscribe());
+
+                            let repository = project
+                                .read(cx)
+                                .git_store()
+                                .read(cx)
+                                .repository_and_path_for_buffer_id(id, cx);
+
+                            let remote_url = repository
+                                .as_ref()
+                                .and_then(|(repo, _)| repo.read(cx).default_remote_url());
+
+                            let blame_buffer = if repository.is_some() {
+                                project.update(cx, |project, cx| {
+                                    project.blame_buffer(&buffer, None, cx)
+                                })
+                            } else {
+                                Task::ready(Ok(None))
+                            };
+
+                            Ok(async move {
+                                (id, snapshot, buffer_edits, blame_buffer.await, remote_url)
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })?;
+                let provider_registry =
+                    cx.update(|cx| GitHostingProviderRegistry::default_global(cx));
+                let (results, errors) = cx
+                    .background_spawn({
+                        async move {
+                            let blame = futures::future::join_all(blame).await;
+                            let mut res = vec![];
+                            let mut errors = vec![];
+                            for (id, snapshot, buffer_edits, blame, remote_url) in blame {
+                                match blame {
+                                    Ok(Some(Blame { entries, messages })) => {
+                                        let entries = build_blame_entry_sum_tree(
+                                            entries,
+                                            snapshot.max_point().row,
+                                        );
+                                        let commit_details = messages
+                                            .into_iter()
+                                            .map(|(oid, message)| {
+                                                let parsed_commit_message =
+                                                    ParsedCommitMessage::parse(
+                                                        oid.to_string(),
+                                                        message,
+                                                        remote_url.as_deref(),
+                                                        Some(provider_registry.clone()),
+                                                    );
+                                                (oid, parsed_commit_message)
+                                            })
+                                            .collect();
+                                        res.push((
+                                            id,
+                                            snapshot,
+                                            buffer_edits,
+                                            Some(entries),
+                                            commit_details,
+                                        ));
+                                    }
+                                    Ok(None) => res.push((
                                         id,
                                         snapshot,
                                         buffer_edits,
-                                        Some(entries),
-                                        commit_details,
-                                    ));
+                                        None,
+                                        Default::default(),
+                                    )),
+                                    Err(e) => errors.push(e),
                                 }
-                                Ok(None) => {
-                                    res.push((id, snapshot, buffer_edits, None, Default::default()))
-                                }
-                                Err(e) => errors.push(e),
                             }
+                            (res, errors)
                         }
-                        (res, errors)
-                    }
-                })
-                .await;
+                    })
+                    .await;
+                all_results.extend(results);
+                all_errors.extend(errors)
+            }
 
             this.update(cx, |this, cx| {
                 this.buffers.clear();
-                for (id, snapshot, buffer_edits, entries, commit_details) in result {
+                for (id, snapshot, buffer_edits, entries, commit_details) in all_results {
                     let Some(entries) = entries else {
                         continue;
                     };
@@ -578,22 +618,25 @@ impl GitBlame {
                     );
                 }
                 cx.notify();
-                if !errors.is_empty() {
+                if !all_errors.is_empty() {
                     this.project.update(cx, |_, cx| {
+                        let all_errors = all_errors
+                            .into_iter()
+                            .map(|e| format!("{e:#}"))
+                            .dedup()
+                            .collect::<Vec<_>>();
+                        let all_errors = all_errors.join(", ");
                         if this.user_triggered {
-                            log::error!("failed to get git blame data: {errors:?}");
-                            let notification = errors
-                                .into_iter()
-                                .format_with(",", |e, f| f(&format_args!("{:#}", e)))
-                                .to_string();
+                            log::error!("failed to get git blame data: {all_errors}");
                             cx.emit(project::Event::Toast {
                                 notification_id: "git-blame".into(),
-                                message: notification,
+                                message: all_errors,
+                                link: None,
                             });
                         } else {
                             // If we weren't triggered by a user, we just log errors in the background, instead of sending
                             // notifications.
-                            log::debug!("failed to get git blame data: {errors:?}");
+                            log::debug!("failed to get git blame data: {all_errors}");
                         }
                     })
                 }
@@ -654,55 +697,6 @@ fn build_blame_entry_sum_tree(entries: Vec<BlameEntry>, max_row: u32) -> SumTree
     entries
 }
 
-async fn parse_commit_messages(
-    messages: impl IntoIterator<Item = (Oid, String)>,
-    remote_url: Option<String>,
-    provider_registry: Arc<GitHostingProviderRegistry>,
-) -> HashMap<Oid, ParsedCommitMessage> {
-    let mut commit_details = HashMap::default();
-
-    let parsed_remote_url = remote_url
-        .as_deref()
-        .and_then(|remote_url| parse_git_remote_url(provider_registry, remote_url));
-
-    for (oid, message) in messages {
-        let permalink = if let Some((provider, git_remote)) = parsed_remote_url.as_ref() {
-            Some(provider.build_commit_permalink(
-                git_remote,
-                git::BuildCommitPermalinkParams {
-                    sha: oid.to_string().as_str(),
-                },
-            ))
-        } else {
-            None
-        };
-
-        let remote = parsed_remote_url
-            .as_ref()
-            .map(|(provider, remote)| GitRemote {
-                host: provider.clone(),
-                owner: remote.owner.clone().into(),
-                repo: remote.repo.clone().into(),
-            });
-
-        let pull_request = parsed_remote_url
-            .as_ref()
-            .and_then(|(provider, remote)| provider.extract_pull_request(remote, &message));
-
-        commit_details.insert(
-            oid,
-            ParsedCommitMessage {
-                message: message.into(),
-                permalink,
-                remote,
-                pull_request,
-            },
-        );
-    }
-
-    commit_details
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -713,7 +707,7 @@ mod tests {
     use rand::prelude::*;
     use serde_json::json;
     use settings::SettingsStore;
-    use std::{cmp, env, ops::Range, path::Path};
+    use std::{cmp, env, ops::Range, path::Path, sync::Mutex};
     use text::BufferId;
     use unindent::Unindent as _;
     use util::{RandomCharIter, path};
@@ -762,12 +756,7 @@ mod tests {
             let settings = SettingsStore::test(cx);
             cx.set_global(settings);
 
-            theme::init(theme::LoadThemes::JustBase, cx);
-
-            language::init(cx);
-            client::init_settings(cx);
-            workspace::init_settings(cx);
-            Project::init_settings(cx);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
 
             crate::init(cx);
         });
@@ -810,7 +799,8 @@ mod tests {
             project::Event::Toast {
                 notification_id: "git-blame".into(),
                 message: "Failed to blame \"file.txt\": failed to get blame for \"file.txt\""
-                    .to_string()
+                    .to_string(),
+                link: None
             }
         );
 
@@ -821,6 +811,73 @@ mod tests {
                         &(0..1)
                             .map(|row| RowInfo {
                                 buffer_row: Some(row),
+                                ..Default::default()
+                            })
+                            .collect::<Vec<_>>(),
+                        cx
+                    )
+                    .collect::<Vec<_>>(),
+                vec![None]
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_blame_ignores_buffers_outside_git_repositories(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+
+        fs.insert_tree(
+            "/not-a-repo",
+            json!({
+                "foo": "bar",
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs, ["/not-a-repo".as_ref()], cx).await;
+
+        let buffer = project
+            .update(cx, |project, cx| {
+                project.open_local_buffer("/not-a-repo/foo", cx)
+            })
+            .await
+            .unwrap();
+
+        let buffer_id = buffer.read_with(cx, |buffer, _| buffer.remote_id());
+
+        let buffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+
+        let _subscription = project.update(cx, |_, cx| {
+            cx.subscribe(&project, {
+                let events = events.clone();
+
+                move |_, _, event: &project::Event, _| {
+                    events
+                        .lock()
+                        .expect("events mutex poisoned")
+                        .push(event.clone());
+                }
+            })
+        });
+
+        let blame = cx.new(|cx| GitBlame::new(buffer.clone(), project.clone(), true, true, cx));
+
+        cx.executor().run_until_parked();
+
+        assert!(events.lock().expect("events mutex poisoned").is_empty());
+
+        blame.update(cx, |blame, cx| {
+            assert_eq!(
+                blame
+                    .blame_for_rows(
+                        &(0..1)
+                            .map(|row| RowInfo {
+                                buffer_row: Some(row),
+                                buffer_id: Some(buffer_id),
                                 ..Default::default()
                             })
                             .collect::<Vec<_>>(),
@@ -1115,19 +1172,18 @@ mod tests {
 
         let fs = FakeFs::new(cx.executor());
         let buffer_initial_text_len = rng.random_range(5..15);
-        let mut buffer_initial_text = Rope::from_str(
+        let mut buffer_initial_text = Rope::from(
             RandomCharIter::new(&mut rng)
                 .take(buffer_initial_text_len)
                 .collect::<String>()
                 .as_str(),
-            cx.background_executor(),
         );
 
         let mut newline_ixs = (0..buffer_initial_text_len).choose_multiple(&mut rng, 5);
         newline_ixs.sort_unstable();
         for newline_ix in newline_ixs.into_iter().rev() {
             let newline_ix = buffer_initial_text.clip_offset(newline_ix, Bias::Right);
-            buffer_initial_text.replace(newline_ix..newline_ix, "\n", cx.background_executor());
+            buffer_initial_text.replace(newline_ix..newline_ix, "\n");
         }
         log::info!("initial buffer text: {:?}", buffer_initial_text);
 

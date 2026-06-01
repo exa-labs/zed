@@ -1,28 +1,23 @@
 mod prompts;
+pub mod rules_to_skills_migration;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use collections::HashMap;
 use futures::FutureExt as _;
 use futures::future::Shared;
-use fuzzy::StringMatchCandidate;
-use gpui::{
-    App, AppContext, Context, Entity, EventEmitter, Global, ReadGlobal, SharedString, Task,
-};
+
+use gpui::{App, AppContext, Entity, Global, ReadGlobal, SharedString, Task};
 use heed::{
     Database, RoTxn,
     types::{SerdeBincode, SerdeJson, Str},
 };
 use parking_lot::RwLock;
 pub use prompts::*;
-use rope::Rope;
+
 use serde::{Deserialize, Serialize};
-use std::{
-    cmp::Reverse,
-    future::Future,
-    path::PathBuf,
-    sync::{Arc, atomic::AtomicBool},
-};
+use std::{future::Future, path::PathBuf, sync::Arc};
+use strum::{EnumIter, IntoEnumIterator as _};
 use text::LineEnding;
 use util::ResultExt;
 use uuid::Uuid;
@@ -36,7 +31,7 @@ pub fn init(cx: &mut App) {
         .spawn(async move |cx| {
             prompt_store_task
                 .await
-                .and_then(|prompt_store| cx.new(|_cx| prompt_store))
+                .map(|prompt_store| cx.new(|_cx| prompt_store))
                 .map_err(Arc::new)
         })
         .shared();
@@ -51,11 +46,51 @@ pub struct PromptMetadata {
     pub saved_at: DateTime<Utc>,
 }
 
+impl PromptMetadata {
+    fn builtin(builtin: BuiltInPrompt) -> Self {
+        Self {
+            id: PromptId::BuiltIn(builtin),
+            title: Some(builtin.title().into()),
+            default: false,
+            saved_at: DateTime::default(),
+        }
+    }
+}
+
+/// Built-in prompts that have default content and can be customized by users.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, EnumIter)]
+pub enum BuiltInPrompt {
+    CommitMessage,
+}
+
+impl BuiltInPrompt {
+    pub fn title(&self) -> &'static str {
+        match self {
+            Self::CommitMessage => "Commit message",
+        }
+    }
+
+    /// Returns the default content for this built-in prompt.
+    pub fn default_content(&self) -> &'static str {
+        match self {
+            Self::CommitMessage => include_str!("../../git_ui/src/commit_message_prompt.txt"),
+        }
+    }
+}
+
+impl std::fmt::Display for BuiltInPrompt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CommitMessage => write!(f, "Commit message"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum PromptId {
     User { uuid: UserPromptId },
-    EditWorkflow,
+    BuiltIn(BuiltInPrompt),
 }
 
 impl PromptId {
@@ -63,8 +98,28 @@ impl PromptId {
         UserPromptId::new().into()
     }
 
+    pub fn as_user(&self) -> Option<UserPromptId> {
+        match self {
+            Self::User { uuid } => Some(*uuid),
+            Self::BuiltIn { .. } => None,
+        }
+    }
+
+    pub fn as_built_in(&self) -> Option<BuiltInPrompt> {
+        match self {
+            Self::User { .. } => None,
+            Self::BuiltIn(builtin) => Some(*builtin),
+        }
+    }
+
     pub fn is_built_in(&self) -> bool {
-        !matches!(self, PromptId::User { .. })
+        matches!(self, Self::BuiltIn { .. })
+    }
+}
+
+impl From<BuiltInPrompt> for PromptId {
+    fn from(builtin: BuiltInPrompt) -> Self {
+        PromptId::BuiltIn(builtin)
     }
 }
 
@@ -94,7 +149,7 @@ impl std::fmt::Display for PromptId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PromptId::User { uuid } => write!(f, "{}", uuid.0),
-            PromptId::EditWorkflow => write!(f, "Edit workflow"),
+            PromptId::BuiltIn(builtin) => write!(f, "{}", builtin),
         }
     }
 }
@@ -102,13 +157,8 @@ impl std::fmt::Display for PromptId {
 pub struct PromptStore {
     env: heed::Env,
     metadata_cache: RwLock<MetadataCache>,
-    metadata: Database<SerdeJson<PromptId>, SerdeJson<PromptMetadata>>,
     bodies: Database<SerdeJson<PromptId>, Str>,
 }
-
-pub struct PromptsUpdatedEvent;
-
-impl EventEmitter<PromptsUpdatedEvent> for PromptStore {}
 
 #[derive(Default)]
 struct MetadataCache {
@@ -123,27 +173,30 @@ impl MetadataCache {
     ) -> Result<Self> {
         let mut cache = MetadataCache::default();
         for result in db.iter(txn)? {
-            let (prompt_id, metadata) = result?;
+            // Fail-open: skip records that can't be decoded (e.g. from a different branch)
+            // rather than failing the entire prompt store initialization.
+            let Ok((prompt_id, metadata)) = result else {
+                log::warn!(
+                    "Skipping unreadable prompt record in database: {:?}",
+                    result.err()
+                );
+                continue;
+            };
             cache.metadata.push(metadata.clone());
             cache.metadata_by_id.insert(prompt_id, metadata);
         }
+
+        // Insert all the built-in prompts that were not customized by the user
+        for builtin in BuiltInPrompt::iter() {
+            let builtin_id = PromptId::BuiltIn(builtin);
+            if !cache.metadata_by_id.contains_key(&builtin_id) {
+                let metadata = PromptMetadata::builtin(builtin);
+                cache.metadata.push(metadata.clone());
+                cache.metadata_by_id.insert(builtin_id, metadata);
+            }
+        }
         cache.sort();
         Ok(cache)
-    }
-
-    fn insert(&mut self, metadata: PromptMetadata) {
-        self.metadata_by_id.insert(metadata.id, metadata.clone());
-        if let Some(old_metadata) = self.metadata.iter_mut().find(|m| m.id == metadata.id) {
-            *old_metadata = metadata;
-        } else {
-            self.metadata.push(metadata);
-        }
-        self.sort();
-    }
-
-    fn remove(&mut self, id: PromptId) {
-        self.metadata.retain(|metadata| metadata.id != id);
-        self.metadata_by_id.remove(&id);
     }
 
     fn sort(&mut self) {
@@ -175,12 +228,6 @@ impl PromptStore {
             let mut txn = db_env.write_txn()?;
             let metadata = db_env.create_database(&mut txn, Some("metadata.v2"))?;
             let bodies = db_env.create_database(&mut txn, Some("bodies.v2"))?;
-
-            // Remove edit workflow prompt, as we decided to opt into it using
-            // a slash command instead.
-            metadata.delete(&mut txn, &PromptId::EditWorkflow).ok();
-            bodies.delete(&mut txn, &PromptId::EditWorkflow).ok();
-
             txn.commit()?;
 
             Self::upgrade_dbs(&db_env, metadata, bodies).log_err();
@@ -192,7 +239,6 @@ impl PromptStore {
             Ok(PromptStore {
                 env: db_env,
                 metadata_cache: RwLock::new(metadata_cache),
-                metadata,
                 bodies,
             })
         })
@@ -203,17 +249,6 @@ impl PromptStore {
         metadata_db: heed::Database<SerdeJson<PromptId>, SerdeJson<PromptMetadata>>,
         bodies_db: heed::Database<SerdeJson<PromptId>, Str>,
     ) -> Result<()> {
-        #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
-        pub struct PromptIdV1(Uuid);
-
-        #[derive(Clone, Debug, Serialize, Deserialize)]
-        pub struct PromptMetadataV1 {
-            pub id: PromptIdV1,
-            pub title: Option<SharedString>,
-            pub default: bool,
-            pub saved_at: DateTime<Utc>,
-        }
-
         let mut txn = env.write_txn()?;
         let Some(bodies_v1_db) = env
             .open_database::<SerdeBincode<PromptIdV1>, SerdeBincode<String>>(
@@ -273,7 +308,16 @@ impl PromptStore {
         let bodies = self.bodies;
         cx.background_spawn(async move {
             let txn = env.read_txn()?;
-            let mut prompt = bodies.get(&txn, &id)?.context("prompt not found")?.into();
+            let mut prompt: String = match bodies.get(&txn, &id)? {
+                Some(body) => body.into(),
+                None => {
+                    if let Some(built_in) = id.as_built_in() {
+                        built_in.default_content().into()
+                    } else {
+                        anyhow::bail!("prompt not found")
+                    }
+                }
+            };
             LineEnding::normalize(&mut prompt);
             Ok(prompt)
         })
@@ -282,190 +326,70 @@ impl PromptStore {
     pub fn all_prompt_metadata(&self) -> Vec<PromptMetadata> {
         self.metadata_cache.read().metadata.clone()
     }
+}
 
-    pub fn default_prompt_metadata(&self) -> Vec<PromptMetadata> {
-        return self
-            .metadata_cache
-            .read()
-            .metadata
-            .iter()
-            .filter(|metadata| metadata.default)
-            .cloned()
-            .collect::<Vec<_>>();
+/// Deprecated: Legacy V1 prompt ID format, used only for migrating data from old databases. Use `PromptId` instead.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Hash)]
+struct PromptIdV1(Uuid);
+
+impl From<UserPromptId> for PromptIdV1 {
+    fn from(id: UserPromptId) -> Self {
+        PromptIdV1(id.0)
     }
+}
 
-    pub fn delete(&self, id: PromptId, cx: &Context<Self>) -> Task<Result<()>> {
-        self.metadata_cache.write().remove(id);
-
-        let db_connection = self.env.clone();
-        let bodies = self.bodies;
-        let metadata = self.metadata;
-
-        let task = cx.background_spawn(async move {
-            let mut txn = db_connection.write_txn()?;
-
-            metadata.delete(&mut txn, &id)?;
-            bodies.delete(&mut txn, &id)?;
-
-            txn.commit()?;
-            anyhow::Ok(())
-        });
-
-        cx.spawn(async move |this, cx| {
-            task.await?;
-            this.update(cx, |_, cx| cx.emit(PromptsUpdatedEvent)).ok();
-            anyhow::Ok(())
-        })
-    }
-
-    /// Returns the number of prompts in the store.
-    pub fn prompt_count(&self) -> usize {
-        self.metadata_cache.read().metadata.len()
-    }
-
-    pub fn metadata(&self, id: PromptId) -> Option<PromptMetadata> {
-        self.metadata_cache.read().metadata_by_id.get(&id).cloned()
-    }
-
-    pub fn first(&self) -> Option<PromptMetadata> {
-        self.metadata_cache.read().metadata.first().cloned()
-    }
-
-    pub fn id_for_title(&self, title: &str) -> Option<PromptId> {
-        let metadata_cache = self.metadata_cache.read();
-        let metadata = metadata_cache
-            .metadata
-            .iter()
-            .find(|metadata| metadata.title.as_ref().map(|title| &***title) == Some(title))?;
-        Some(metadata.id)
-    }
-
-    pub fn search(
-        &self,
-        query: String,
-        cancellation_flag: Arc<AtomicBool>,
-        cx: &App,
-    ) -> Task<Vec<PromptMetadata>> {
-        let cached_metadata = self.metadata_cache.read().metadata.clone();
-        let executor = cx.background_executor().clone();
-        cx.background_spawn(async move {
-            let mut matches = if query.is_empty() {
-                cached_metadata
-            } else {
-                let candidates = cached_metadata
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(ix, metadata)| {
-                        Some(StringMatchCandidate::new(ix, metadata.title.as_ref()?))
-                    })
-                    .collect::<Vec<_>>();
-                let matches = fuzzy::match_strings(
-                    &candidates,
-                    &query,
-                    false,
-                    true,
-                    100,
-                    &cancellation_flag,
-                    executor,
-                )
-                .await;
-                matches
-                    .into_iter()
-                    .map(|mat| cached_metadata[mat.candidate_id].clone())
-                    .collect()
-            };
-            matches.sort_by_key(|metadata| Reverse(metadata.default));
-            matches
-        })
-    }
-
-    pub fn save(
-        &self,
-        id: PromptId,
-        title: Option<SharedString>,
-        default: bool,
-        body: Rope,
-        cx: &Context<Self>,
-    ) -> Task<Result<()>> {
-        if id.is_built_in() {
-            return Task::ready(Err(anyhow!("built-in prompts cannot be saved")));
-        }
-
-        let prompt_metadata = PromptMetadata {
-            id,
-            title,
-            default,
-            saved_at: Utc::now(),
-        };
-        self.metadata_cache.write().insert(prompt_metadata.clone());
-
-        let db_connection = self.env.clone();
-        let bodies = self.bodies;
-        let metadata = self.metadata;
-
-        let task = cx.background_spawn(async move {
-            let mut txn = db_connection.write_txn()?;
-
-            metadata.put(&mut txn, &id, &prompt_metadata)?;
-            bodies.put(&mut txn, &id, &body.to_string())?;
-
-            txn.commit()?;
-
-            anyhow::Ok(())
-        });
-
-        cx.spawn(async move |this, cx| {
-            task.await?;
-            this.update(cx, |_, cx| cx.emit(PromptsUpdatedEvent)).ok();
-            anyhow::Ok(())
-        })
-    }
-
-    pub fn save_metadata(
-        &self,
-        id: PromptId,
-        mut title: Option<SharedString>,
-        default: bool,
-        cx: &Context<Self>,
-    ) -> Task<Result<()>> {
-        let mut cache = self.metadata_cache.write();
-
-        if id.is_built_in() {
-            title = cache
-                .metadata_by_id
-                .get(&id)
-                .and_then(|metadata| metadata.title.clone());
-        }
-
-        let prompt_metadata = PromptMetadata {
-            id,
-            title,
-            default,
-            saved_at: Utc::now(),
-        };
-
-        cache.insert(prompt_metadata.clone());
-
-        let db_connection = self.env.clone();
-        let metadata = self.metadata;
-
-        let task = cx.background_spawn(async move {
-            let mut txn = db_connection.write_txn()?;
-            metadata.put(&mut txn, &id, &prompt_metadata)?;
-            txn.commit()?;
-
-            anyhow::Ok(())
-        });
-
-        cx.spawn(async move |this, cx| {
-            task.await?;
-            this.update(cx, |_, cx| cx.emit(PromptsUpdatedEvent)).ok();
-            anyhow::Ok(())
-        })
-    }
+/// Deprecated: Legacy V1 prompt metadata format, used only for migrating data from old databases. Use `PromptMetadata` instead.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PromptMetadataV1 {
+    id: PromptIdV1,
+    title: Option<SharedString>,
+    default: bool,
+    saved_at: DateTime<Utc>,
 }
 
 /// Wraps a shared future to a prompt store so it can be assigned as a context global.
 pub struct GlobalPromptStore(Shared<Task<Result<Entity<PromptStore>, Arc<anyhow::Error>>>>);
 
 impl Global for GlobalPromptStore {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    #[gpui::test]
+    async fn test_built_in_prompt_load(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("prompts-db");
+
+        let store = cx.update(|cx| PromptStore::new(db_path, cx)).await.unwrap();
+        let store = cx.new(|_cx| store);
+
+        let commit_message_id = PromptId::BuiltIn(BuiltInPrompt::CommitMessage);
+
+        let loaded_content = store
+            .update(cx, |store, cx| store.load(commit_message_id, cx))
+            .await
+            .unwrap();
+
+        let mut expected_content = BuiltInPrompt::CommitMessage.default_content().to_string();
+        LineEnding::normalize(&mut expected_content);
+        assert_eq!(
+            loaded_content.trim(),
+            expected_content.trim(),
+            "Loading a built-in prompt not in DB should return default content"
+        );
+
+        assert!(
+            store.read_with(cx, |store, _| {
+                store
+                    .all_prompt_metadata()
+                    .iter()
+                    .any(|metadata| metadata.id == commit_message_id)
+            }),
+            "Built-in prompt should always be in cache"
+        );
+    }
+}

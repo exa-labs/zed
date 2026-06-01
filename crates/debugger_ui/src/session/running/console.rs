@@ -2,28 +2,30 @@ use super::{
     stack_frame_list::{StackFrameList, StackFrameListEvent},
     variable_list::VariableList,
 };
-use alacritty_terminal::vte::ansi;
 use anyhow::Result;
 use collections::HashMap;
 use dap::{CompletionItem, CompletionItemType, OutputEvent};
-use editor::{Bias, CompletionProvider, Editor, EditorElement, EditorStyle, ExcerptId};
+use editor::{
+    Bias, CompletionProvider, Editor, EditorElement, EditorMode, EditorStyle, HighlightKey,
+    MultiBufferOffset, SizingBehavior,
+};
 use fuzzy::StringMatchCandidate;
 use gpui::{
-    Action as _, AppContext, Context, Corner, Entity, FocusHandle, Focusable, HighlightStyle, Hsla,
-    Render, Subscription, Task, TextStyle, WeakEntity, actions,
+    Action as _, AppContext, Context, Entity, FocusHandle, Focusable, HighlightStyle, Hsla, Render,
+    Subscription, Task, TextStyle, WeakEntity, actions,
 };
 use language::{Anchor, Buffer, CharScopeContext, CodeLabel, TextBufferSnapshot, ToOffset};
 use menu::{Confirm, SelectNext, SelectPrevious};
 use project::{
-    Completion, CompletionDisplayOptions, CompletionResponse,
+    CompletionDisplayOptions, CompletionResponse,
     debugger::session::{CompletionsQuery, OutputToken, Session},
     lsp_store::CompletionDocumentation,
     search_history::{SearchHistory, SearchHistoryCursor},
 };
 use settings::Settings;
-use std::fmt::Write;
-use std::{cell::RefCell, ops::Range, rc::Rc, usize};
-use theme::{Theme, ThemeSettings};
+use std::{ops::Range, rc::Rc, usize};
+use theme::Theme;
+use theme_settings::ThemeSettings;
 use ui::{ContextMenu, Divider, PopoverMenu, SplitButton, Tooltip, prelude::*};
 use util::ResultExt;
 
@@ -59,11 +61,17 @@ impl Console {
     ) -> Self {
         let console = cx.new(|cx| {
             let mut editor = Editor::multi_line(window, cx);
+            editor.set_mode(EditorMode::Full {
+                scale_ui_elements_with_buffer_font_size: true,
+                show_active_line_background: true,
+                sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+            });
             editor.move_to_end(&editor::actions::MoveToEnd, window, cx);
             editor.set_read_only(true);
             editor.disable_scrollbars_and_minimap(window, cx);
             editor.set_show_gutter(false, cx);
             editor.set_show_runnables(false, cx);
+            editor.set_show_bookmarks(false, cx);
             editor.set_show_breakpoints(false, cx);
             editor.set_show_code_actions(false, cx);
             editor.set_show_line_numbers(false, cx);
@@ -75,6 +83,7 @@ impl Console {
             editor.set_show_indent_guides(false, cx);
             editor.set_show_edit_predictions(Some(false), window, cx);
             editor.set_use_modal_editing(false);
+            editor.disable_mouse_wheel_zoom();
             editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
             editor
         });
@@ -97,7 +106,7 @@ impl Console {
             cx.subscribe(&stack_frame_list, Self::handle_stack_frame_list_events),
             cx.on_focus(&focus_handle, window, |console, window, cx| {
                 if console.is_running(cx) {
-                    console.query_bar.focus_handle(cx).focus(window);
+                    console.query_bar.focus_handle(cx).focus(window, cx);
                 }
             }),
         ];
@@ -153,7 +162,9 @@ impl Console {
     ) -> Task<Result<()>> {
         self.console.update(cx, |_, cx| {
             cx.spawn_in(window, async move |console, cx| {
-                let mut len = console.update(cx, |this, cx| this.buffer().read(cx).len(cx))?;
+                let mut len = console
+                    .update(cx, |this, cx| this.buffer().read(cx).len(cx))?
+                    .0;
                 let (output, spans, background_spans) = cx
                     .background_spawn(async move {
                         let mut all_spans = Vec::new();
@@ -163,30 +174,14 @@ impl Console {
 
                         for event in &events {
                             scratch.clear();
-                            let mut ansi_handler = ConsoleHandler::default();
-                            let mut ansi_processor =
-                                ansi::Processor::<ansi::StdSyncHandler>::default();
-
                             let trimmed_output = event.output.trim_end();
-                            let _ = writeln!(&mut scratch, "{trimmed_output}");
-                            ansi_processor.advance(&mut ansi_handler, scratch.as_bytes());
-                            let output = std::mem::take(&mut ansi_handler.output);
+                            scratch.push_str(trimmed_output);
+                            scratch.push('\n');
+                            let parsed_output = terminal::parse_ansi_text(scratch.as_bytes());
+                            let output = parsed_output.text;
                             to_insert.extend(output.chars());
-                            let mut spans = std::mem::take(&mut ansi_handler.spans);
-                            let mut background_spans =
-                                std::mem::take(&mut ansi_handler.background_spans);
-                            if ansi_handler.current_range_start < output.len() {
-                                spans.push((
-                                    ansi_handler.current_range_start..output.len(),
-                                    ansi_handler.current_color,
-                                ));
-                            }
-                            if ansi_handler.current_background_range_start < output.len() {
-                                background_spans.push((
-                                    ansi_handler.current_background_range_start..output.len(),
-                                    ansi_handler.current_background_color,
-                                ));
-                            }
+                            let mut spans = parsed_output.foreground_spans;
+                            let mut background_spans = parsed_output.background_spans;
 
                             for (range, _) in spans.iter_mut() {
                                 let start_offset = len + range.start;
@@ -212,15 +207,13 @@ impl Console {
                     console.insert(&output, window, cx);
                     console.set_read_only(true);
 
-                    struct ConsoleAnsiHighlight;
-
                     let buffer = console.buffer().read(cx).snapshot(cx);
 
                     for (range, color) in spans {
                         let Some(color) = color else { continue };
                         let start_offset = range.start;
-                        let range =
-                            buffer.anchor_after(range.start)..buffer.anchor_before(range.end);
+                        let range = buffer.anchor_after(MultiBufferOffset(range.start))
+                            ..buffer.anchor_before(MultiBufferOffset(range.end));
                         let style = HighlightStyle {
                             color: Some(terminal_view::terminal_element::convert_color(
                                 &color,
@@ -228,10 +221,11 @@ impl Console {
                             )),
                             ..Default::default()
                         };
-                        console.highlight_text_key::<ConsoleAnsiHighlight>(
-                            start_offset,
+                        console.highlight_text_key(
+                            HighlightKey::ConsoleAnsiHighlight(start_offset),
                             vec![range],
                             style,
+                            false,
                             cx,
                         );
                     }
@@ -239,12 +233,13 @@ impl Console {
                     for (range, color) in background_spans {
                         let Some(color) = color else { continue };
                         let start_offset = range.start;
-                        let range =
-                            buffer.anchor_after(range.start)..buffer.anchor_before(range.end);
-                        console.highlight_background_key::<ConsoleAnsiHighlight>(
-                            start_offset,
+                        let range = buffer.anchor_after(MultiBufferOffset(range.start))
+                            ..buffer.anchor_before(MultiBufferOffset(range.end));
+                        let color_fn = background_color_fetcher(color);
+                        console.highlight_background(
+                            HighlightKey::ConsoleAnsiHighlight(start_offset),
                             &[range],
-                            color_fetcher(color),
+                            move |_, theme| color_fn(theme),
                             cx,
                         );
                     }
@@ -293,7 +288,8 @@ impl Console {
     }
 
     fn previous_query(&mut self, _: &SelectPrevious, window: &mut Window, cx: &mut Context<Self>) {
-        let prev = self.history.previous(&mut self.cursor);
+        let current_query = self.query_bar.read(cx).text(cx);
+        let prev = self.history.previous(&mut self.cursor, &current_query);
         if let Some(prev) = prev {
             self.query_bar.update(cx, |editor, cx| {
                 editor.set_text(prev, window, cx);
@@ -372,7 +368,7 @@ impl Console {
                     })
                 },
             )
-            .anchor(Corner::TopRight)
+            .anchor(gpui::Anchor::TopRight)
     }
 
     fn render_console(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -516,7 +512,6 @@ struct ConsoleQueryBarCompletionProvider(WeakEntity<Console>);
 impl CompletionProvider for ConsoleQueryBarCompletionProvider {
     fn completions(
         &self,
-        _excerpt_id: ExcerptId,
         buffer: &Entity<Buffer>,
         buffer_position: language::Anchor,
         _trigger: editor::CompletionContext,
@@ -542,24 +537,12 @@ impl CompletionProvider for ConsoleQueryBarCompletionProvider {
         }
     }
 
-    fn apply_additional_edits_for_completion(
-        &self,
-        _buffer: Entity<Buffer>,
-        _completions: Rc<RefCell<Box<[Completion]>>>,
-        _completion_index: usize,
-        _push_to_history: bool,
-        _cx: &mut Context<Editor>,
-    ) -> gpui::Task<anyhow::Result<Option<language::Transaction>>> {
-        Task::ready(Ok(None))
-    }
-
     fn is_completion_trigger(
         &self,
         buffer: &Entity<Buffer>,
         position: language::Anchor,
         text: &str,
         trigger_in_words: bool,
-        menu_is_open: bool,
         cx: &mut Context<Editor>,
     ) -> bool {
         let mut chars = text.chars();
@@ -570,9 +553,6 @@ impl CompletionProvider for ConsoleQueryBarCompletionProvider {
         };
 
         let snapshot = buffer.read(cx).snapshot();
-        if !menu_is_open && !snapshot.settings_at(position, cx).show_completions_on_input {
-            return false;
-        }
 
         let classifier = snapshot
             .char_classifier_at(position)
@@ -669,6 +649,8 @@ impl ConsoleQueryBarCompletionProvider {
                         ),
                         new_text: string_match.string.clone(),
                         label: CodeLabel::plain(string_match.string.clone(), None),
+                        match_start: None,
+                        snippet_deduplication_key: None,
                         icon_path: None,
                         documentation: Some(CompletionDocumentation::MultiLineMarkdown(
                             variable_value.into(),
@@ -676,6 +658,7 @@ impl ConsoleQueryBarCompletionProvider {
                         confirm: None,
                         source: project::CompletionSource::Custom,
                         insert_text_mode: None,
+                        group: None,
                     })
                 })
                 .collect::<Vec<_>>();
@@ -782,9 +765,12 @@ impl ConsoleQueryBarCompletionProvider {
                         documentation: completion.detail.map(|detail| {
                             CompletionDocumentation::MultiLineMarkdown(detail.into())
                         }),
+                        match_start: None,
+                        snippet_deduplication_key: None,
                         confirm: None,
                         source: project::CompletionSource::Dap { sort_text },
                         insert_text_mode: None,
+                        group: None,
                     }
                 })
                 .collect();
@@ -798,158 +784,21 @@ impl ConsoleQueryBarCompletionProvider {
     }
 }
 
-#[derive(Default)]
-struct ConsoleHandler {
-    output: String,
-    spans: Vec<(Range<usize>, Option<ansi::Color>)>,
-    background_spans: Vec<(Range<usize>, Option<ansi::Color>)>,
-    current_range_start: usize,
-    current_background_range_start: usize,
-    current_color: Option<ansi::Color>,
-    current_background_color: Option<ansi::Color>,
-    pos: usize,
-}
-
-impl ConsoleHandler {
-    fn break_span(&mut self, color: Option<ansi::Color>) {
-        self.spans.push((
-            self.current_range_start..self.output.len(),
-            self.current_color,
-        ));
-        self.current_color = color;
-        self.current_range_start = self.pos;
-    }
-
-    fn break_background_span(&mut self, color: Option<ansi::Color>) {
-        self.background_spans.push((
-            self.current_background_range_start..self.output.len(),
-            self.current_background_color,
-        ));
-        self.current_background_color = color;
-        self.current_background_range_start = self.pos;
-    }
-}
-
-impl ansi::Handler for ConsoleHandler {
-    fn input(&mut self, c: char) {
-        self.output.push(c);
-        self.pos += c.len_utf8();
-    }
-
-    fn linefeed(&mut self) {
-        self.output.push('\n');
-        self.pos += 1;
-    }
-
-    fn put_tab(&mut self, count: u16) {
-        self.output
-            .extend(std::iter::repeat('\t').take(count as usize));
-        self.pos += count as usize;
-    }
-
-    fn terminal_attribute(&mut self, attr: ansi::Attr) {
-        match attr {
-            ansi::Attr::Foreground(color) => {
-                self.break_span(Some(color));
-            }
-            ansi::Attr::Background(color) => {
-                self.break_background_span(Some(color));
-            }
-            ansi::Attr::Reset => {
-                self.break_span(None);
-                self.break_background_span(None);
-            }
-            _ => {}
+fn background_color_fetcher(color: terminal::Color) -> impl Fn(&Theme) -> Hsla {
+    move |theme| {
+        if terminal::is_default_background_color(color) {
+            theme.colors().terminal_background
+        } else {
+            terminal_view::terminal_element::convert_color(&color, theme)
         }
     }
-}
-
-fn color_fetcher(color: ansi::Color) -> fn(&Theme) -> Hsla {
-    let color_fetcher: fn(&Theme) -> Hsla = match color {
-        // Named and theme defined colors
-        ansi::Color::Named(n) => match n {
-            ansi::NamedColor::Black => |theme| theme.colors().terminal_ansi_black,
-            ansi::NamedColor::Red => |theme| theme.colors().terminal_ansi_red,
-            ansi::NamedColor::Green => |theme| theme.colors().terminal_ansi_green,
-            ansi::NamedColor::Yellow => |theme| theme.colors().terminal_ansi_yellow,
-            ansi::NamedColor::Blue => |theme| theme.colors().terminal_ansi_blue,
-            ansi::NamedColor::Magenta => |theme| theme.colors().terminal_ansi_magenta,
-            ansi::NamedColor::Cyan => |theme| theme.colors().terminal_ansi_cyan,
-            ansi::NamedColor::White => |theme| theme.colors().terminal_ansi_white,
-            ansi::NamedColor::BrightBlack => |theme| theme.colors().terminal_ansi_bright_black,
-            ansi::NamedColor::BrightRed => |theme| theme.colors().terminal_ansi_bright_red,
-            ansi::NamedColor::BrightGreen => |theme| theme.colors().terminal_ansi_bright_green,
-            ansi::NamedColor::BrightYellow => |theme| theme.colors().terminal_ansi_bright_yellow,
-            ansi::NamedColor::BrightBlue => |theme| theme.colors().terminal_ansi_bright_blue,
-            ansi::NamedColor::BrightMagenta => |theme| theme.colors().terminal_ansi_bright_magenta,
-            ansi::NamedColor::BrightCyan => |theme| theme.colors().terminal_ansi_bright_cyan,
-            ansi::NamedColor::BrightWhite => |theme| theme.colors().terminal_ansi_bright_white,
-            ansi::NamedColor::Foreground => |theme| theme.colors().terminal_foreground,
-            ansi::NamedColor::Background => |theme| theme.colors().terminal_background,
-            ansi::NamedColor::Cursor => |theme| theme.players().local().cursor,
-            ansi::NamedColor::DimBlack => |theme| theme.colors().terminal_ansi_dim_black,
-            ansi::NamedColor::DimRed => |theme| theme.colors().terminal_ansi_dim_red,
-            ansi::NamedColor::DimGreen => |theme| theme.colors().terminal_ansi_dim_green,
-            ansi::NamedColor::DimYellow => |theme| theme.colors().terminal_ansi_dim_yellow,
-            ansi::NamedColor::DimBlue => |theme| theme.colors().terminal_ansi_dim_blue,
-            ansi::NamedColor::DimMagenta => |theme| theme.colors().terminal_ansi_dim_magenta,
-            ansi::NamedColor::DimCyan => |theme| theme.colors().terminal_ansi_dim_cyan,
-            ansi::NamedColor::DimWhite => |theme| theme.colors().terminal_ansi_dim_white,
-            ansi::NamedColor::BrightForeground => |theme| theme.colors().terminal_bright_foreground,
-            ansi::NamedColor::DimForeground => |theme| theme.colors().terminal_dim_foreground,
-        },
-        // 'True' colors
-        ansi::Color::Spec(_) => |theme| theme.colors().editor_background,
-        // 8 bit, indexed colors
-        ansi::Color::Indexed(i) => {
-            match i {
-                // 0-15 are the same as the named colors above
-                0 => |theme| theme.colors().terminal_ansi_black,
-                1 => |theme| theme.colors().terminal_ansi_red,
-                2 => |theme| theme.colors().terminal_ansi_green,
-                3 => |theme| theme.colors().terminal_ansi_yellow,
-                4 => |theme| theme.colors().terminal_ansi_blue,
-                5 => |theme| theme.colors().terminal_ansi_magenta,
-                6 => |theme| theme.colors().terminal_ansi_cyan,
-                7 => |theme| theme.colors().terminal_ansi_white,
-                8 => |theme| theme.colors().terminal_ansi_bright_black,
-                9 => |theme| theme.colors().terminal_ansi_bright_red,
-                10 => |theme| theme.colors().terminal_ansi_bright_green,
-                11 => |theme| theme.colors().terminal_ansi_bright_yellow,
-                12 => |theme| theme.colors().terminal_ansi_bright_blue,
-                13 => |theme| theme.colors().terminal_ansi_bright_magenta,
-                14 => |theme| theme.colors().terminal_ansi_bright_cyan,
-                15 => |theme| theme.colors().terminal_ansi_bright_white,
-                // 16-231 are a 6x6x6 RGB color cube, mapped to 0-255 using steps defined by XTerm.
-                // See: https://github.com/xterm-x11/xterm-snapshots/blob/master/256colres.pl
-                // 16..=231 => {
-                //     let (r, g, b) = rgb_for_index(index as u8);
-                //     rgba_color(
-                //         if r == 0 { 0 } else { r * 40 + 55 },
-                //         if g == 0 { 0 } else { g * 40 + 55 },
-                //         if b == 0 { 0 } else { b * 40 + 55 },
-                //     )
-                // }
-                // 232-255 are a 24-step grayscale ramp from (8, 8, 8) to (238, 238, 238).
-                // 232..=255 => {
-                //     let i = index as u8 - 232; // Align index to 0..24
-                //     let value = i * 10 + 8;
-                //     rgba_color(value, value, value)
-                // }
-                // For compatibility with the alacritty::Colors interface
-                // See: https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/src/term/color.rs
-                _ => |_| gpui::black(),
-            }
-        }
-    };
-    color_fetcher
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tests::init_test;
-    use editor::test::editor_test_context::EditorTestContext;
+    use editor::{MultiBufferOffset, test::editor_test_context::EditorTestContext};
     use gpui::TestAppContext;
     use language::Point;
 
@@ -981,8 +830,8 @@ mod tests {
         cx.update_editor(|editor, _, cx| {
             editor.edit(
                 vec![(
-                    snapshot.offset_for_anchor(&replace_range.start)
-                        ..snapshot.offset_for_anchor(&replace_range.end),
+                    MultiBufferOffset(snapshot.offset_for_anchor(&replace_range.start))
+                        ..MultiBufferOffset(snapshot.offset_for_anchor(&replace_range.end)),
                     replacement,
                 )],
                 cx,
@@ -990,6 +839,23 @@ mod tests {
         });
 
         pretty_assertions::assert_eq!(expect, cx.display_text());
+    }
+
+    #[gpui::test]
+    fn test_background_color_fetcher_preserves_default_background(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        cx.update(|cx| {
+            let mut theme = theme::GlobalTheme::theme(cx).as_ref().clone();
+            theme.styles.colors.terminal_background = gpui::red();
+            theme.styles.colors.terminal_ansi_background = gpui::blue();
+
+            let color = background_color_fetcher(terminal::Color::Named(
+                terminal::NamedColor::Background,
+            ))(&theme);
+
+            assert_eq!(color, gpui::red());
+        });
     }
 
     #[gpui::test]

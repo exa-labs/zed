@@ -8,6 +8,7 @@ pub enum SpinnerVariant {
     #[default]
     Dots,
     DotsVariant,
+    Sand,
 }
 
 /// A spinner indication, based on the label component, that loops through
@@ -41,6 +42,11 @@ impl SpinnerVariant {
         match self {
             SpinnerVariant::Dots => vec!["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
             SpinnerVariant::DotsVariant => vec!["⣼", "⣹", "⢻", "⠿", "⡟", "⣏", "⣧", "⣶"],
+            SpinnerVariant::Sand => vec![
+                "⠁", "⠂", "⠄", "⡀", "⡈", "⡐", "⡠", "⣀", "⣁", "⣂", "⣄", "⣌", "⣔", "⣤", "⣥", "⣦",
+                "⣮", "⣶", "⣷", "⣿", "⡿", "⠿", "⢟", "⠟", "⡛", "⠛", "⠫", "⢋", "⠋", "⠍", "⡉", "⠉",
+                "⠑", "⠡", "⢁",
+            ],
         }
     }
 
@@ -48,6 +54,7 @@ impl SpinnerVariant {
         match self {
             SpinnerVariant::Dots => Duration::from_millis(1000),
             SpinnerVariant::DotsVariant => Duration::from_millis(1000),
+            SpinnerVariant::Sand => Duration::from_millis(2000),
         }
     }
 
@@ -55,6 +62,7 @@ impl SpinnerVariant {
         match self {
             SpinnerVariant::Dots => "spinner_label_dots",
             SpinnerVariant::DotsVariant => "spinner_label_dots_variant",
+            SpinnerVariant::Sand => "spinner_label_dots_variant_2",
         }
     }
 }
@@ -69,7 +77,7 @@ impl SpinnerLabel {
         let duration = variant.duration();
 
         SpinnerLabel {
-            base: Label::new(frames[0]),
+            base: Label::new(frames[0]).color(Color::Muted),
             variant,
             frames,
             duration,
@@ -82,6 +90,10 @@ impl SpinnerLabel {
 
     pub fn dots_variant() -> Self {
         Self::with_variant(SpinnerVariant::DotsVariant)
+    }
+
+    pub fn sand() -> Self {
+        Self::with_variant(SpinnerVariant::Sand)
     }
 }
 
@@ -152,7 +164,7 @@ impl RenderOnce for SpinnerLabel {
         let frames = self.frames.clone();
         let duration = self.duration;
 
-        self.base.color(Color::Muted).with_animation(
+        self.base.with_animation(
             self.variant.animation_id(),
             Animation::new(duration).repeat(),
             move |mut label, delta| {
@@ -178,15 +190,21 @@ impl Component for SpinnerLabel {
         "Spinner Label"
     }
 
-    fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
+    fn description() -> &'static str {
+        "A text-based loading indicator that animates through a sequence of \
+        unicode glyphs to show ongoing or indeterminate work."
+    }
+
+    fn preview(_window: &mut Window, _cx: &mut App) -> AnyElement {
         let examples = vec![
             single_example("Default", SpinnerLabel::new().into_any_element()),
             single_example(
                 "Dots Variant",
                 SpinnerLabel::dots_variant().into_any_element(),
             ),
+            single_example("Sand Variant", SpinnerLabel::sand().into_any_element()),
         ];
 
-        Some(example_group(examples).vertical().into_any_element())
+        example_group(examples).vertical().into_any_element()
     }
 }

@@ -172,12 +172,7 @@ impl PickerDelegate for ToolPickerDelegate {
         self.selected_index = ix;
     }
 
-    fn can_select(
-        &mut self,
-        ix: usize,
-        _window: &mut Window,
-        _cx: &mut Context<Picker<Self>>,
-    ) -> bool {
+    fn can_select(&self, ix: usize, _window: &mut Window, _cx: &mut Context<Picker<Self>>) -> bool {
         let item = &self.filtered_items[ix];
         match item {
             PickerItem::Tool { .. } => true,
@@ -314,6 +309,7 @@ impl PickerDelegate for ToolPickerDelegate {
                                 )
                             })
                             .collect(),
+                        default_model: default_profile.default_model.clone(),
                     });
 
                 if let Some(server_id) = server_id {

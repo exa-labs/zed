@@ -18,7 +18,7 @@ use std::{
     borrow::Borrow,
     ffi::OsStr,
     fmt::Debug,
-    net::Ipv4Addr,
+    net::IpAddr,
     ops::Deref,
     path::{Path, PathBuf},
     sync::Arc,
@@ -106,7 +106,7 @@ impl<'a> From<&'a str> for DebugAdapterName {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TcpArguments {
-    pub host: Ipv4Addr,
+    pub host: IpAddr,
     pub port: u16,
     pub timeout: Option<u64>,
 }
@@ -324,6 +324,7 @@ pub async fn download_adapter_from_github(
             extract_zip(&version_path, file)
                 .await
                 // we cannot check the status as some adapter include files with names that trigger `Illegal byte sequence`
+                .inspect_err(|e| log::warn!("ZIP extraction error: {}. Ignoring...", e))
                 .ok();
 
             util::fs::remove_matching(&adapter_path, |entry| {

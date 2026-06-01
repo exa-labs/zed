@@ -32,9 +32,9 @@
 //! your own custom layout algorithm or rendering a code editor.
 
 use crate::{
-    App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ELEMENT_ARENA, ElementId,
-    FocusHandle, InspectorElementId, LayoutId, Pixels, Point, Size, Style, Window,
-    util::FluentBuilder,
+    App, ArenaBox, AvailableSpace, Bounds, Context, DispatchNodeId, ElementId, FocusHandle,
+    InspectorElementId, LayoutId, Pixels, Point, SharedString, Size, Style, Window,
+    util::FluentBuilder, window::with_element_arena,
 };
 use derive_more::{Deref, DerefMut};
 use std::{
@@ -102,6 +102,22 @@ pub trait Element: 'static + IntoElement {
         window: &mut Window,
         cx: &mut App,
     );
+
+    /// Returns the accessible role for this element, if any.
+    /// Elements that return `None` are not included in the accessibility tree.
+    ///
+    /// Note: inclusion in accessibility tree requires non-`None` [`id`][Element::id].
+    ///
+    /// See the [accessibility guide](crate::_accessibility) for an overview.
+    fn a11y_role(&self) -> Option<accesskit::Role> {
+        None
+    }
+
+    /// Write accessibility properties to the given node.
+    /// Called only when `a11y_role()` returns `Some`.
+    ///
+    /// See the [accessibility guide](crate::_accessibility) for an overview.
+    fn write_a11y_info(&self, _node: &mut accesskit::Node) {}
 
     /// Convert this element into a dynamically-typed [`AnyElement`].
     fn into_any(self) -> AnyElement {
@@ -197,8 +213,27 @@ impl<C: RenderOnce> Component<C> {
     }
 }
 
+fn prepaint_component(
+    (element, name): &mut (AnyElement, &'static str),
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.with_id(ElementId::Name(SharedString::new_static(name)), |window| {
+        element.prepaint(window, cx);
+    })
+}
+
+fn paint_component(
+    (element, name): &mut (AnyElement, &'static str),
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.with_id(ElementId::Name(SharedString::new_static(name)), |window| {
+        element.paint(window, cx);
+    })
+}
 impl<C: RenderOnce> Element for Component<C> {
-    type RequestLayoutState = AnyElement;
+    type RequestLayoutState = (AnyElement, &'static str);
     type PrepaintState = ();
 
     fn id(&self) -> Option<ElementId> {
@@ -220,7 +255,7 @@ impl<C: RenderOnce> Element for Component<C> {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        window.with_global_id(ElementId::Name(type_name::<C>().into()), |_, window| {
+        window.with_id(ElementId::Name(type_name::<C>().into()), |window| {
             let mut element = self
                 .component
                 .take()
@@ -229,7 +264,7 @@ impl<C: RenderOnce> Element for Component<C> {
                 .into_any_element();
 
             let layout_id = element.request_layout(window, cx);
-            (layout_id, element)
+            (layout_id, (element, type_name::<C>()))
         })
     }
 
@@ -238,13 +273,11 @@ impl<C: RenderOnce> Element for Component<C> {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         _: Bounds<Pixels>,
-        element: &mut AnyElement,
+        state: &mut Self::RequestLayoutState,
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.with_global_id(ElementId::Name(type_name::<C>().into()), |_, window| {
-            element.prepaint(window, cx);
-        })
+        prepaint_component(state, window, cx);
     }
 
     fn paint(
@@ -252,14 +285,12 @@ impl<C: RenderOnce> Element for Component<C> {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         _: Bounds<Pixels>,
-        element: &mut Self::RequestLayoutState,
+        state: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
-        window.with_global_id(ElementId::Name(type_name::<C>().into()), |_, window| {
-            element.paint(window, cx);
-        })
+        paint_component(state, window, cx);
     }
 }
 
@@ -284,6 +315,15 @@ impl Display for GlobalElementId {
             write!(f, "{}", element_id)?;
         }
         Ok(())
+    }
+}
+
+impl GlobalElementId {
+    pub(crate) fn accesskit_node_id(&self) -> accesskit::NodeId {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::hash::DefaultHasher::default();
+        self.hash(&mut hasher);
+        accesskit::NodeId(hasher.finish())
     }
 }
 
@@ -416,6 +456,26 @@ impl<E: Element> Drawable<E> {
                 }
 
                 let bounds = window.layout_bounds(layout_id);
+                let mut pushed_a11y_node = false;
+                if window.a11y.is_active() {
+                    if let Some(global_id) = global_id.as_ref() {
+                        if let Some(role) = self.element.a11y_role() {
+                            let node_id = global_id.accesskit_node_id();
+                            let mut node = accesskit::Node::new(role);
+                            let scale = window.scale_factor();
+                            node.set_bounds(accesskit::Rect {
+                                x0: (bounds.origin.x.0 * scale) as f64,
+                                y0: (bounds.origin.y.0 * scale) as f64,
+                                x1: ((bounds.origin.x.0 + bounds.size.width.0) * scale) as f64,
+                                y1: ((bounds.origin.y.0 + bounds.size.height.0) * scale) as f64,
+                            });
+                            self.element.write_a11y_info(&mut node);
+                            window.a11y.node_bounds.insert(node_id, bounds);
+                            pushed_a11y_node = window.a11y.nodes.push(node_id, node);
+                        }
+                    }
+                }
+
                 let node_id = window.next_frame.dispatch_tree.push_node();
                 let prepaint = self.element.prepaint(
                     global_id.as_ref(),
@@ -426,6 +486,10 @@ impl<E: Element> Drawable<E> {
                     cx,
                 );
                 window.next_frame.dispatch_tree.pop_node();
+
+                if pushed_a11y_node {
+                    window.a11y.nodes.pop();
+                }
 
                 if global_id.is_some() {
                     window.element_id_stack.pop();
@@ -548,18 +612,22 @@ where
         &mut self.element
     }
 
+    #[inline]
     fn request_layout(&mut self, window: &mut Window, cx: &mut App) -> LayoutId {
         Drawable::request_layout(self, window, cx)
     }
 
+    #[inline]
     fn prepaint(&mut self, window: &mut Window, cx: &mut App) {
         Drawable::prepaint(self, window, cx);
     }
 
+    #[inline]
     fn paint(&mut self, window: &mut Window, cx: &mut App) {
         Drawable::paint(self, window, cx);
     }
 
+    #[inline]
     fn layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
@@ -579,8 +647,7 @@ impl AnyElement {
         E: 'static + Element,
         E::RequestLayoutState: Any,
     {
-        let element = ELEMENT_ARENA
-            .with_borrow_mut(|arena| arena.alloc(|| Drawable::new(element)))
+        let element = with_element_arena(|arena| arena.alloc(|| Drawable::new(element)))
             .map(|element| element as &mut dyn ElementObject);
         AnyElement(element)
     }

@@ -2,32 +2,37 @@ use std::pin::Pin;
 use std::str::FromStr as _;
 use std::sync::Arc;
 
+use anthropic::AnthropicModelMode;
 use anyhow::{Result, anyhow};
-use cloud_llm_client::CompletionIntent;
 use collections::HashMap;
-use copilot::copilot_chat::{
-    ChatMessage, ChatMessageContent, ChatMessagePart, CopilotChat, ImageUrl,
-    Model as CopilotChatModel, ModelVendor, Request as CopilotChatRequest, ResponseEvent, Tool,
-    ToolCall,
+use copilot::{GlobalCopilotAuth, Status};
+use copilot_chat::responses as copilot_responses;
+use copilot_chat::{
+    ChatLocation, ChatMessage, ChatMessageContent, ChatMessagePart, CopilotChat,
+    CopilotChatConfiguration, Function, FunctionContent, ImageUrl, Model as CopilotChatModel,
+    ModelVendor, Request as CopilotChatRequest, ResponseEvent, Tool, ToolCall, ToolCallContent,
+    ToolChoice,
 };
-use copilot::{Copilot, Status};
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{FutureExt, Stream, StreamExt};
-use gpui::{Action, AnyView, App, AsyncApp, Entity, Render, Subscription, Task, svg};
+use gpui::{AnyView, App, AsyncApp, Entity, Subscription, Task};
 use http_client::StatusCode;
 use language::language_settings::all_language_settings;
 use language_model::{
-    AuthenticateError, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelName, LanguageModelProvider, LanguageModelProviderId,
-    LanguageModelProviderName, LanguageModelProviderState, LanguageModelRequest,
-    LanguageModelRequestMessage, LanguageModelToolChoice, LanguageModelToolResultContent,
-    LanguageModelToolSchemaFormat, LanguageModelToolUse, MessageContent, RateLimiter, Role,
-    StopReason, TokenUsage,
+    AuthenticateError, CompletionIntent, IconOrSvg, LanguageModel, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelCostInfo, LanguageModelEffortLevel, LanguageModelId,
+    LanguageModelName, LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
+    LanguageModelProviderState, LanguageModelRequest, LanguageModelRequestMessage,
+    LanguageModelToolChoice, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
+    LanguageModelToolUse, MessageContent, RateLimiter, Role, StopReason, TokenUsage,
 };
 use settings::SettingsStore;
-use ui::{CommonAnimationExt, prelude::*};
+use ui::prelude::*;
 use util::debug_panic;
+
+use crate::provider::anthropic::{AnthropicEventMapper, AnthropicPromptCacheMode, into_anthropic};
+use language_model::util::{fix_streamed_json, parse_tool_arguments};
 
 const PROVIDER_ID: LanguageModelProviderId = LanguageModelProviderId::new("copilot_chat");
 const PROVIDER_NAME: LanguageModelProviderName =
@@ -60,7 +65,7 @@ impl CopilotChatLanguageModelProvider {
                 _settings_subscription: cx.observe_global::<SettingsStore>(|_, cx| {
                     if let Some(copilot_chat) = CopilotChat::global(cx) {
                         let language_settings = all_language_settings(None, cx);
-                        let configuration = copilot::copilot_chat::CopilotChatConfiguration {
+                        let configuration = CopilotChatConfiguration {
                             enterprise_uri: language_settings
                                 .edit_predictions
                                 .copilot
@@ -104,8 +109,8 @@ impl LanguageModelProvider for CopilotChatLanguageModelProvider {
         PROVIDER_NAME
     }
 
-    fn icon(&self) -> IconName {
-        IconName::Copilot
+    fn icon(&self) -> IconOrSvg {
+        IconOrSvg::Icon(IconName::Copilot)
     }
 
     fn default_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
@@ -140,13 +145,15 @@ impl LanguageModelProvider for CopilotChatLanguageModelProvider {
             return Task::ready(Ok(()));
         };
 
-        let Some(copilot) = Copilot::global(cx) else {
-            return Task::ready( Err(anyhow!(
-                "Copilot must be enabled for Copilot Chat to work. Please enable Copilot and try again."
-            ).into()));
+        let Some(copilot) = GlobalCopilotAuth::try_global(cx).cloned() else {
+            return Task::ready(Err(anyhow!(concat!(
+                "Copilot must be enabled for Copilot Chat to work. ",
+                "Please enable Copilot and try again."
+            ))
+            .into()));
         };
 
-        let err = match copilot.read(cx).status() {
+        let err = match copilot.0.read(cx).status() {
             Status::Authorized => return Task::ready(Ok(())),
             Status::Disabled => anyhow!(
                 "Copilot must be enabled for Copilot Chat to work. Please enable Copilot and try again."
@@ -175,8 +182,18 @@ impl LanguageModelProvider for CopilotChatLanguageModelProvider {
         _: &mut Window,
         cx: &mut App,
     ) -> AnyView {
-        let state = self.state.clone();
-        cx.new(|cx| ConfigurationView::new(state, cx)).into()
+        cx.new(|cx| {
+            copilot_ui::ConfigurationView::new(
+                |cx| {
+                    CopilotChat::global(cx)
+                        .map(|m| m.read(cx).is_authenticated())
+                        .unwrap_or(false)
+                },
+                copilot_ui::ConfigurationMode::Chat,
+                cx,
+            )
+        })
+        .into()
     }
 
     fn reset_credentials(&self, _cx: &mut App) -> Task<Result<()>> {
@@ -184,25 +201,6 @@ impl LanguageModelProvider for CopilotChatLanguageModelProvider {
             "Signing out of GitHub Copilot Chat is currently not supported."
         )))
     }
-}
-
-fn collect_tiktoken_messages(
-    request: LanguageModelRequest,
-) -> Vec<tiktoken_rs::ChatCompletionRequestMessage> {
-    request
-        .messages
-        .into_iter()
-        .map(|message| tiktoken_rs::ChatCompletionRequestMessage {
-            role: match message.role {
-                Role::User => "user".into(),
-                Role::Assistant => "assistant".into(),
-                Role::System => "system".into(),
-            },
-            content: Some(message.string_contents()),
-            name: None,
-            function_call: None,
-        })
-        .collect::<Vec<_>>()
 }
 
 pub struct CopilotChatLanguageModel {
@@ -231,8 +229,40 @@ impl LanguageModel for CopilotChatLanguageModel {
         self.model.supports_tools()
     }
 
+    fn supports_streaming_tools(&self) -> bool {
+        true
+    }
+
     fn supports_images(&self) -> bool {
         self.model.supports_vision()
+    }
+
+    fn supports_thinking(&self) -> bool {
+        self.model.can_think()
+    }
+
+    fn supported_effort_levels(&self) -> Vec<LanguageModelEffortLevel> {
+        let levels = self.model.reasoning_effort_levels();
+        if levels.is_empty() {
+            return vec![];
+        }
+        levels
+            .iter()
+            .map(|level| {
+                let name = match level.as_str() {
+                    "low" => "Low".into(),
+                    "medium" => "Medium".into(),
+                    "high" => "High".into(),
+                    "xhigh" => "Extra High".into(),
+                    _ => language_model::SharedString::from(level.clone()),
+                };
+                LanguageModelEffortLevel {
+                    name,
+                    value: language_model::SharedString::from(level.clone()),
+                    is_default: level == "high",
+                }
+            })
+            .collect()
     }
 
     fn tool_input_format(&self) -> LanguageModelToolSchemaFormat {
@@ -254,33 +284,19 @@ impl LanguageModel for CopilotChatLanguageModel {
         }
     }
 
+    fn model_cost_info(&self) -> Option<LanguageModelCostInfo> {
+        LanguageModelCostInfo::RequestCost {
+            cost_per_request: self.model.multiplier(),
+        }
+        .into()
+    }
+
     fn telemetry_id(&self) -> String {
         format!("copilot_chat/{}", self.model.id())
     }
 
     fn max_token_count(&self) -> u64 {
         self.model.max_token_count()
-    }
-
-    fn count_tokens(
-        &self,
-        request: LanguageModelRequest,
-        cx: &App,
-    ) -> BoxFuture<'static, Result<u64>> {
-        let model = self.model.clone();
-        cx.background_spawn(async move {
-            let messages = collect_tiktoken_messages(request);
-            // Copilot uses OpenAI tiktoken tokenizer for all it's model irrespective of the underlying provider(vendor).
-            let tokenizer_model = match model.tokenizer() {
-                Some("o200k_base") => "gpt-4o",
-                Some("cl100k_base") => "gpt-4",
-                _ => "gpt-4o",
-            };
-
-            tiktoken_rs::num_tokens_from_messages(tokenizer_model, &messages)
-                .map(|tokens| tokens as u64)
-        })
-        .boxed()
     }
 
     fn stream_completion(
@@ -301,18 +317,108 @@ impl LanguageModel for CopilotChatLanguageModel {
             | CompletionIntent::TerminalInlineAssist
             | CompletionIntent::GenerateGitCommitMessage => true,
 
-            CompletionIntent::ToolResults
+            CompletionIntent::Subagent
+            | CompletionIntent::ToolResults
             | CompletionIntent::ThreadSummarization
             | CompletionIntent::CreateFile
             | CompletionIntent::EditFile => false,
         });
 
+        if self.model.supports_messages() {
+            let location = intent_to_chat_location(request.intent);
+            let model = self.model.clone();
+            let request_limiter = self.request_limiter.clone();
+            let future = cx.spawn(async move |cx| {
+                let effort = request
+                    .thinking_effort
+                    .as_ref()
+                    .and_then(|e| anthropic::Effort::from_str(e).ok());
+
+                let mut anthropic_request = into_anthropic(
+                    request,
+                    model.id().to_string(),
+                    0.0,
+                    model.max_output_tokens() as u64,
+                    if model.supports_adaptive_thinking() {
+                        AnthropicModelMode::Thinking {
+                            budget_tokens: None,
+                        }
+                    } else if model.supports_thinking() {
+                        AnthropicModelMode::Thinking {
+                            budget_tokens: compute_thinking_budget(
+                                model.min_thinking_budget(),
+                                model.max_thinking_budget(),
+                                model.max_output_tokens() as u32,
+                            ),
+                        }
+                    } else {
+                        AnthropicModelMode::Default
+                    },
+                    AnthropicPromptCacheMode::Legacy,
+                );
+
+                anthropic_request.temperature = None;
+
+                // The Copilot proxy doesn't support eager_input_streaming on tools.
+                for tool in &mut anthropic_request.tools {
+                    tool.eager_input_streaming = false;
+                }
+
+                if model.supports_adaptive_thinking() {
+                    if anthropic_request.thinking.is_some() {
+                        anthropic_request.thinking = Some(anthropic::Thinking::Adaptive {
+                            display: Some(anthropic::AdaptiveThinkingDisplay::Summarized),
+                        });
+                        anthropic_request.output_config =
+                            effort.map(|effort| anthropic::OutputConfig {
+                                effort: Some(effort),
+                            });
+                    }
+                }
+
+                let anthropic_beta =
+                    if !model.supports_adaptive_thinking() && model.supports_thinking() {
+                        Some("interleaved-thinking-2025-05-14".to_string())
+                    } else {
+                        None
+                    };
+
+                let body = serde_json::to_string(&anthropic::StreamingRequest {
+                    base: anthropic_request,
+                    stream: true,
+                })
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+                let stream = CopilotChat::stream_messages(
+                    body,
+                    location,
+                    is_user_initiated,
+                    anthropic_beta,
+                    cx.clone(),
+                );
+
+                request_limiter
+                    .stream(async move {
+                        let events = stream.await?;
+                        let mapper = AnthropicEventMapper::new();
+                        Ok(mapper.map_stream(events).boxed())
+                    })
+                    .await
+            });
+            return async move { Ok(future.await?.boxed()) }.boxed();
+        }
+
         if self.model.supports_response() {
+            let location = intent_to_chat_location(request.intent);
             let responses_request = into_copilot_responses(&self.model, request);
             let request_limiter = self.request_limiter.clone();
             let future = cx.spawn(async move |cx| {
-                let request =
-                    CopilotChat::stream_response(responses_request, is_user_initiated, cx.clone());
+                let request = CopilotChat::stream_response(
+                    responses_request,
+                    location,
+                    is_user_initiated,
+                    cx.clone(),
+                );
                 request_limiter
                     .stream(async move {
                         let stream = request.await?;
@@ -324,6 +430,7 @@ impl LanguageModel for CopilotChatLanguageModel {
             return async move { Ok(future.await?.boxed()) }.boxed();
         }
 
+        let location = intent_to_chat_location(request.intent);
         let copilot_request = match into_copilot_chat(&self.model, request) {
             Ok(request) => request,
             Err(err) => return futures::future::ready(Err(err.into())).boxed(),
@@ -332,8 +439,12 @@ impl LanguageModel for CopilotChatLanguageModel {
 
         let request_limiter = self.request_limiter.clone();
         let future = cx.spawn(async move |cx| {
-            let request =
-                CopilotChat::stream_completion(copilot_request, is_user_initiated, cx.clone());
+            let request = CopilotChat::stream_completion(
+                copilot_request,
+                location,
+                is_user_initiated,
+                cx.clone(),
+            );
             request_limiter
                 .stream(async move {
                     let response = request.await?;
@@ -357,17 +468,22 @@ pub fn map_to_language_model_completion_events(
         id: String,
         name: String,
         arguments: String,
+        thought_signature: Option<String>,
     }
 
     struct State {
         events: Pin<Box<dyn Send + Stream<Item = Result<ResponseEvent>>>>,
         tool_calls_by_index: HashMap<usize, RawToolCall>,
+        reasoning_opaque: Option<String>,
+        reasoning_text: Option<String>,
     }
 
     futures::stream::unfold(
         State {
             events,
             tool_calls_by_index: HashMap::default(),
+            reasoning_opaque: None,
+            reasoning_text: None,
         },
         move |mut state| async move {
             if let Some(event) = state.events.next().await {
@@ -398,6 +514,14 @@ pub fn map_to_language_model_completion_events(
                             events.push(Ok(LanguageModelCompletionEvent::Text(content)));
                         }
 
+                        // Capture reasoning data from the delta (e.g. for Gemini 3)
+                        if let Some(opaque) = delta.reasoning_opaque.clone() {
+                            state.reasoning_opaque = Some(opaque);
+                        }
+                        if let Some(text) = delta.reasoning_text.clone() {
+                            state.reasoning_text = Some(text);
+                        }
+
                         for (index, tool_call) in delta.tool_calls.iter().enumerate() {
                             let tool_index = tool_call.index.unwrap_or(index);
                             let entry = state.tool_calls_by_index.entry(tool_index).or_default();
@@ -413,6 +537,28 @@ pub fn map_to_language_model_completion_events(
 
                                 if let Some(arguments) = function.arguments.clone() {
                                     entry.arguments.push_str(&arguments);
+                                }
+
+                                if let Some(thought_signature) = function.thought_signature.clone()
+                                {
+                                    entry.thought_signature = Some(thought_signature);
+                                }
+                            }
+
+                            if !entry.id.is_empty() && !entry.name.is_empty() {
+                                if let Ok(input) = serde_json::from_str::<serde_json::Value>(
+                                    &fix_streamed_json(&entry.arguments),
+                                ) {
+                                    events.push(Ok(LanguageModelCompletionEvent::ToolUse(
+                                        LanguageModelToolUse {
+                                            id: entry.id.clone().into(),
+                                            name: entry.name.as_str().into(),
+                                            is_input_complete: false,
+                                            input,
+                                            raw_input: entry.arguments.clone(),
+                                            thought_signature: entry.thought_signature.clone(),
+                                        },
+                                    )));
                                 }
                             }
                         }
@@ -435,18 +581,36 @@ pub fn map_to_language_model_completion_events(
                                 )));
                             }
                             Some("tool_calls") => {
+                                // Gemini 3 models send reasoning_opaque/reasoning_text that must
+                                // be preserved and sent back in subsequent requests. Emit as
+                                // ReasoningDetails so the agent stores it in the message.
+                                if state.reasoning_opaque.is_some()
+                                    || state.reasoning_text.is_some()
+                                {
+                                    let mut details = serde_json::Map::new();
+                                    if let Some(opaque) = state.reasoning_opaque.take() {
+                                        details.insert(
+                                            "reasoning_opaque".to_string(),
+                                            serde_json::Value::String(opaque),
+                                        );
+                                    }
+                                    if let Some(text) = state.reasoning_text.take() {
+                                        details.insert(
+                                            "reasoning_text".to_string(),
+                                            serde_json::Value::String(text),
+                                        );
+                                    }
+                                    events.push(Ok(
+                                        LanguageModelCompletionEvent::ReasoningDetails(
+                                            serde_json::Value::Object(details),
+                                        ),
+                                    ));
+                                }
+
                                 events.extend(state.tool_calls_by_index.drain().map(
-                                    |(_, tool_call)| {
-                                        // The model can output an empty string
-                                        // to indicate the absence of arguments.
-                                        // When that happens, create an empty
-                                        // object instead.
-                                        let arguments = if tool_call.arguments.is_empty() {
-                                            Ok(serde_json::Value::Object(Default::default()))
-                                        } else {
-                                            serde_json::Value::from_str(&tool_call.arguments)
-                                        };
-                                        match arguments {
+                                    |(_, tool_call)| match parse_tool_arguments(
+                                        &tool_call.arguments,
+                                    ) {
                                         Ok(input) => Ok(LanguageModelCompletionEvent::ToolUse(
                                             LanguageModelToolUse {
                                                 id: tool_call.id.into(),
@@ -454,6 +618,7 @@ pub fn map_to_language_model_completion_events(
                                                 is_input_complete: true,
                                                 input,
                                                 raw_input: tool_call.arguments,
+                                                thought_signature: tool_call.thought_signature,
                                             },
                                         )),
                                         Err(error) => Ok(
@@ -464,7 +629,6 @@ pub fn map_to_language_model_completion_events(
                                                 json_parse_error: error.to_string(),
                                             },
                                         ),
-                                    }
                                     },
                                 ));
 
@@ -495,18 +659,20 @@ pub fn map_to_language_model_completion_events(
 
 pub struct CopilotResponsesEventMapper {
     pending_stop_reason: Option<StopReason>,
+    reasoning_items: Vec<copilot_responses::ResponseReasoningInputItem>,
 }
 
 impl CopilotResponsesEventMapper {
     pub fn new() -> Self {
         Self {
             pending_stop_reason: None,
+            reasoning_items: Vec::new(),
         }
     }
 
     pub fn map_stream(
         mut self,
-        events: Pin<Box<dyn Send + Stream<Item = Result<copilot::copilot_responses::StreamEvent>>>>,
+        events: Pin<Box<dyn Send + Stream<Item = Result<copilot_responses::StreamEvent>>>>,
     ) -> impl Stream<Item = Result<LanguageModelCompletionEvent, LanguageModelCompletionError>>
     {
         events.flat_map(move |event| {
@@ -519,11 +685,11 @@ impl CopilotResponsesEventMapper {
 
     fn map_event(
         &mut self,
-        event: copilot::copilot_responses::StreamEvent,
+        event: copilot_responses::StreamEvent,
     ) -> Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
         match event {
-            copilot::copilot_responses::StreamEvent::OutputItemAdded { item, .. } => match item {
-                copilot::copilot_responses::ResponseOutputItem::Message { id, .. } => {
+            copilot_responses::StreamEvent::OutputItemAdded { item, .. } => match item {
+                copilot_responses::ResponseOutputItem::Message { id, .. } => {
                     vec![Ok(LanguageModelCompletionEvent::StartMessage {
                         message_id: id,
                     })]
@@ -531,7 +697,7 @@ impl CopilotResponsesEventMapper {
                 _ => Vec::new(),
             },
 
-            copilot::copilot_responses::StreamEvent::OutputTextDelta { delta, .. } => {
+            copilot_responses::StreamEvent::OutputTextDelta { delta, .. } => {
                 if delta.is_empty() {
                     Vec::new()
                 } else {
@@ -539,16 +705,17 @@ impl CopilotResponsesEventMapper {
                 }
             }
 
-            copilot::copilot_responses::StreamEvent::OutputItemDone { item, .. } => match item {
-                copilot::copilot_responses::ResponseOutputItem::Message { .. } => Vec::new(),
-                copilot::copilot_responses::ResponseOutputItem::FunctionCall {
+            copilot_responses::StreamEvent::OutputItemDone { item, .. } => match item {
+                copilot_responses::ResponseOutputItem::Message { .. } => Vec::new(),
+                copilot_responses::ResponseOutputItem::FunctionCall {
                     call_id,
                     name,
                     arguments,
+                    thought_signature,
                     ..
                 } => {
                     let mut events = Vec::new();
-                    match serde_json::from_str::<serde_json::Value>(&arguments) {
+                    match parse_tool_arguments(&arguments) {
                         Ok(input) => events.push(Ok(LanguageModelCompletionEvent::ToolUse(
                             LanguageModelToolUse {
                                 id: call_id.into(),
@@ -556,6 +723,7 @@ impl CopilotResponsesEventMapper {
                                 is_input_complete: true,
                                 input,
                                 raw_input: arguments.clone(),
+                                thought_signature,
                             },
                         ))),
                         Err(error) => {
@@ -573,14 +741,14 @@ impl CopilotResponsesEventMapper {
                     events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)));
                     events
                 }
-                copilot::copilot_responses::ResponseOutputItem::Reasoning {
+                copilot_responses::ResponseOutputItem::Reasoning {
+                    id,
                     summary,
                     encrypted_content,
-                    ..
                 } => {
                     let mut events = Vec::new();
 
-                    if let Some(blocks) = summary {
+                    if let Some(blocks) = summary.as_ref() {
                         let mut text = String::new();
                         for block in blocks {
                             text.push_str(&block.text);
@@ -593,15 +761,17 @@ impl CopilotResponsesEventMapper {
                         }
                     }
 
-                    if let Some(data) = encrypted_content {
-                        events.push(Ok(LanguageModelCompletionEvent::RedactedThinking { data }));
+                    if let Some(reasoning_item) =
+                        reasoning_input_item_from_output(&id, encrypted_content)
+                    {
+                        events.extend(self.capture_reasoning_item(reasoning_item));
                     }
 
                     events
                 }
             },
 
-            copilot::copilot_responses::StreamEvent::Completed { response } => {
+            copilot_responses::StreamEvent::Completed { response } => {
                 let mut events = Vec::new();
                 if let Some(usage) = response.usage {
                     events.push(Ok(LanguageModelCompletionEvent::UsageUpdate(TokenUsage {
@@ -617,18 +787,16 @@ impl CopilotResponsesEventMapper {
                 events
             }
 
-            copilot::copilot_responses::StreamEvent::Incomplete { response } => {
+            copilot_responses::StreamEvent::Incomplete { response } => {
                 let reason = response
                     .incomplete_details
                     .as_ref()
                     .and_then(|details| details.reason.as_ref());
                 let stop_reason = match reason {
-                    Some(copilot::copilot_responses::IncompleteReason::MaxOutputTokens) => {
+                    Some(copilot_responses::IncompleteReason::MaxOutputTokens) => {
                         StopReason::MaxTokens
                     }
-                    Some(copilot::copilot_responses::IncompleteReason::ContentFilter) => {
-                        StopReason::Refusal
-                    }
+                    Some(copilot_responses::IncompleteReason::ContentFilter) => StopReason::Refusal,
                     _ => self
                         .pending_stop_reason
                         .take()
@@ -648,7 +816,7 @@ impl CopilotResponsesEventMapper {
                 events
             }
 
-            copilot::copilot_responses::StreamEvent::Failed { response } => {
+            copilot_responses::StreamEvent::Failed { response } => {
                 let provider = PROVIDER_NAME;
                 let (status_code, message) = match response.error {
                     Some(error) => {
@@ -668,20 +836,112 @@ impl CopilotResponsesEventMapper {
                 })]
             }
 
-            copilot::copilot_responses::StreamEvent::GenericError { error } => vec![Err(
-                LanguageModelCompletionError::Other(anyhow!(format!("{error:?}"))),
+            copilot_responses::StreamEvent::GenericError { error } => vec![Err(
+                LanguageModelCompletionError::Other(anyhow!(error.message)),
             )],
 
-            copilot::copilot_responses::StreamEvent::Created { .. }
-            | copilot::copilot_responses::StreamEvent::Unknown => Vec::new(),
+            copilot_responses::StreamEvent::Created { .. }
+            | copilot_responses::StreamEvent::Unknown => Vec::new(),
+        }
+    }
+
+    fn capture_reasoning_item(
+        &mut self,
+        reasoning_item: copilot_responses::ResponseReasoningInputItem,
+    ) -> Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
+        if self.reasoning_items.contains(&reasoning_item) {
+            return Vec::new();
+        }
+
+        if let Some(id) = reasoning_item.id.as_ref()
+            && let Some(existing_reasoning_item) = self
+                .reasoning_items
+                .iter_mut()
+                .find(|existing_reasoning_item| existing_reasoning_item.id.as_ref() == Some(id))
+        {
+            *existing_reasoning_item = reasoning_item;
+        } else {
+            self.reasoning_items.push(reasoning_item);
+        }
+
+        self.emit_response_message_metadata()
+    }
+
+    fn emit_response_message_metadata(
+        &self,
+    ) -> Vec<Result<LanguageModelCompletionEvent, LanguageModelCompletionError>> {
+        let details = serde_json::to_value(CopilotResponseMessageMetadata {
+            reasoning_items: self.reasoning_items.clone(),
+        });
+
+        match details {
+            Ok(details) => vec![Ok(LanguageModelCompletionEvent::ReasoningDetails(details))],
+            Err(error) => vec![Err(LanguageModelCompletionError::Other(anyhow!(error)))],
         }
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CopilotResponseMessageMetadata {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reasoning_items: Vec<copilot_responses::ResponseReasoningInputItem>,
+}
+
+fn append_reasoning_details_to_response_items(
+    reasoning_details: Option<&serde_json::Value>,
+    replayed_reasoning_item_indexes: &mut HashMap<String, usize>,
+    input_items: &mut Vec<copilot_responses::ResponseInputItem>,
+) {
+    let Some(reasoning_details) = reasoning_details else {
+        return;
+    };
+
+    let Some(metadata) =
+        serde_json::from_value::<CopilotResponseMessageMetadata>(reasoning_details.clone()).ok()
+    else {
+        return;
+    };
+
+    for mut reasoning_item in metadata.reasoning_items {
+        reasoning_item.summary.clear();
+        if let Some(id) = reasoning_item.id.as_ref() {
+            if let Some(index) = replayed_reasoning_item_indexes.get(id) {
+                input_items[*index] =
+                    copilot_responses::ResponseInputItem::Reasoning(reasoning_item);
+                return;
+            }
+
+            replayed_reasoning_item_indexes.insert(id.clone(), input_items.len());
+        }
+
+        input_items.push(copilot_responses::ResponseInputItem::Reasoning(
+            reasoning_item,
+        ));
+    }
+}
+
+fn reasoning_input_item_from_output(
+    id: &str,
+    encrypted_content: Option<String>,
+) -> Option<copilot_responses::ResponseReasoningInputItem> {
+    if encrypted_content.is_none() {
+        return None;
+    }
+    Some(copilot_responses::ResponseReasoningInputItem {
+        id: Some(id.to_string()),
+        summary: Vec::new(),
+        encrypted_content,
+    })
+}
+
 fn into_copilot_chat(
-    model: &copilot::copilot_chat::Model,
+    model: &CopilotChatModel,
     request: LanguageModelRequest,
 ) -> Result<CopilotChatRequest> {
+    let temperature = request.temperature;
+    let tool_choice = request.tool_choice;
+    let thinking_allowed = request.thinking_allowed;
+
     let mut request_messages: Vec<LanguageModelRequestMessage> = Vec::new();
     for message in request.messages {
         if let Some(last_message) = request_messages.last_mut() {
@@ -701,23 +961,40 @@ fn into_copilot_chat(
             Role::User => {
                 for content in &message.content {
                     if let MessageContent::ToolResult(tool_result) = content {
-                        let content = match &tool_result.content {
-                            LanguageModelToolResultContent::Text(text) => text.to_string().into(),
-                            LanguageModelToolResultContent::Image(image) => {
-                                if model.supports_vision() {
-                                    ChatMessageContent::Multipart(vec![ChatMessagePart::Image {
-                                        image_url: ImageUrl {
-                                            url: image.to_base64_url(),
-                                        },
-                                    }])
-                                } else {
-                                    debug_panic!(
-                                        "This should be caught at {} level",
-                                        tool_result.tool_name
-                                    );
-                                    "[Tool responded with an image, but this model does not support vision]".to_string().into()
+                        let parts: Vec<ChatMessagePart> = tool_result
+                            .content
+                            .iter()
+                            .map(|part| match part {
+                                LanguageModelToolResultContent::Text(text) => {
+                                    ChatMessagePart::Text {
+                                        text: text.to_string(),
+                                    }
                                 }
+                                LanguageModelToolResultContent::Image(image) => {
+                                    if model.supports_vision() {
+                                        ChatMessagePart::Image {
+                                            image_url: ImageUrl {
+                                                url: image.to_base64_url(),
+                                            },
+                                        }
+                                    } else {
+                                        debug_panic!(
+                                            "This should be caught at {} level",
+                                            tool_result.tool_name
+                                        );
+                                        ChatMessagePart::Text {
+                                            text: "[Tool responded with an image, but this model does not support vision]".to_string(),
+                                        }
+                                    }
+                                }
+                            })
+                            .collect();
+
+                        let content = match parts.as_slice() {
+                            [ChatMessagePart::Text { text }] => {
+                                ChatMessageContent::Plain(text.clone())
                             }
+                            _ => ChatMessageContent::Multipart(parts),
                         };
 
                         messages.push(ChatMessage::Tool {
@@ -766,10 +1043,11 @@ fn into_copilot_chat(
                     if let MessageContent::ToolUse(tool_use) = content {
                         tool_calls.push(ToolCall {
                             id: tool_use.id.to_string(),
-                            content: copilot::copilot_chat::ToolCallContent::Function {
-                                function: copilot::copilot_chat::FunctionContent {
+                            content: ToolCallContent::Function {
+                                function: FunctionContent {
                                     name: tool_use.name.to_string(),
                                     arguments: serde_json::to_string(&tool_use.input)?,
+                                    thought_signature: tool_use.thought_signature.clone(),
                                 },
                             },
                         });
@@ -779,10 +1057,9 @@ fn into_copilot_chat(
                 let text_content = {
                     let mut buffer = String::new();
                     for string in message.content.iter().filter_map(|content| match content {
-                        MessageContent::Text(text) | MessageContent::Thinking { text, .. } => {
-                            Some(text.as_str())
-                        }
-                        MessageContent::ToolUse(_)
+                        MessageContent::Text(text) => Some(text.as_str()),
+                        MessageContent::Thinking { .. }
+                        | MessageContent::ToolUse(_)
                         | MessageContent::RedactedThinking(_)
                         | MessageContent::ToolResult(_)
                         | MessageContent::Image(_) => None,
@@ -793,6 +1070,22 @@ fn into_copilot_chat(
                     buffer
                 };
 
+                // Extract reasoning_opaque and reasoning_text from reasoning_details
+                let (reasoning_opaque, reasoning_text) =
+                    if let Some(details) = &message.reasoning_details {
+                        let opaque = details
+                            .get("reasoning_opaque")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let text = details
+                            .get("reasoning_text")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        (opaque, text)
+                    } else {
+                        (None, None)
+                    };
+
                 messages.push(ChatMessage::Assistant {
                     content: if text_content.is_empty() {
                         ChatMessageContent::empty()
@@ -800,6 +1093,8 @@ fn into_copilot_chat(
                         text_content.into()
                     },
                     tool_calls,
+                    reasoning_opaque,
+                    reasoning_text,
                 });
             }
             Role::System => messages.push(ChatMessage::System {
@@ -812,7 +1107,7 @@ fn into_copilot_chat(
         .tools
         .iter()
         .map(|tool| Tool::Function {
-            function: copilot::copilot_chat::Function {
+            function: Function {
                 name: tool.name.clone(),
                 description: tool.description.clone(),
                 parameters: tool.input_schema.clone(),
@@ -821,80 +1116,122 @@ fn into_copilot_chat(
         .collect::<Vec<_>>();
 
     Ok(CopilotChatRequest {
-        intent: true,
         n: 1,
         stream: model.uses_streaming(),
-        temperature: 0.1,
+        temperature: temperature.unwrap_or(0.1),
         model: model.id().to_string(),
         messages,
         tools,
-        tool_choice: request.tool_choice.map(|choice| match choice {
-            LanguageModelToolChoice::Auto => copilot::copilot_chat::ToolChoice::Auto,
-            LanguageModelToolChoice::Any => copilot::copilot_chat::ToolChoice::Any,
-            LanguageModelToolChoice::None => copilot::copilot_chat::ToolChoice::None,
+        tool_choice: tool_choice.map(|choice| match choice {
+            LanguageModelToolChoice::Auto => ToolChoice::Auto,
+            LanguageModelToolChoice::Any => ToolChoice::Required,
+            LanguageModelToolChoice::None => ToolChoice::None,
         }),
+        thinking_budget: if thinking_allowed && model.supports_thinking() {
+            compute_thinking_budget(
+                model.min_thinking_budget(),
+                model.max_thinking_budget(),
+                model.max_output_tokens() as u32,
+            )
+        } else {
+            None
+        },
     })
 }
 
+fn compute_thinking_budget(
+    min_budget: Option<u32>,
+    max_budget: Option<u32>,
+    max_output_tokens: u32,
+) -> Option<u32> {
+    let configured_budget: u32 = 16000;
+    let min_budget = min_budget.unwrap_or(1024);
+    let max_budget = max_budget.unwrap_or(max_output_tokens.saturating_sub(1));
+    let normalized = configured_budget.max(min_budget);
+    Some(
+        normalized
+            .min(max_budget)
+            .min(max_output_tokens.saturating_sub(1)),
+    )
+}
+
+fn intent_to_chat_location(intent: Option<CompletionIntent>) -> ChatLocation {
+    match intent {
+        Some(CompletionIntent::UserPrompt) => ChatLocation::Agent,
+        Some(CompletionIntent::Subagent) => ChatLocation::Agent,
+        Some(CompletionIntent::ToolResults) => ChatLocation::Agent,
+        Some(CompletionIntent::ThreadSummarization) => ChatLocation::Panel,
+        Some(CompletionIntent::ThreadContextSummarization) => ChatLocation::Panel,
+        Some(CompletionIntent::CreateFile) => ChatLocation::Agent,
+        Some(CompletionIntent::EditFile) => ChatLocation::Agent,
+        Some(CompletionIntent::InlineAssist) => ChatLocation::Editor,
+        Some(CompletionIntent::TerminalInlineAssist) => ChatLocation::Terminal,
+        Some(CompletionIntent::GenerateGitCommitMessage) => ChatLocation::Other,
+        None => ChatLocation::Panel,
+    }
+}
+
 fn into_copilot_responses(
-    model: &copilot::copilot_chat::Model,
+    model: &CopilotChatModel,
     request: LanguageModelRequest,
-) -> copilot::copilot_responses::Request {
-    use copilot::copilot_responses as responses;
+) -> copilot_responses::Request {
+    use copilot_responses as responses;
 
     let LanguageModelRequest {
         thread_id: _,
         prompt_id: _,
         intent: _,
-        mode: _,
         messages,
         tools,
         tool_choice,
         stop: _,
         temperature,
-        thinking_allowed: _,
+        thinking_allowed,
+        thinking_effort,
+        speed: _,
     } = request;
 
     let mut input_items: Vec<responses::ResponseInputItem> = Vec::new();
+    let mut replayed_reasoning_item_indexes = HashMap::default();
 
     for message in messages {
         match message.role {
             Role::User => {
                 for content in &message.content {
                     if let MessageContent::ToolResult(tool_result) = content {
-                        let output = if let Some(out) = &tool_result.output {
-                            match out {
-                                serde_json::Value::String(s) => {
-                                    responses::ResponseFunctionOutput::Text(s.clone())
-                                }
-                                serde_json::Value::Null => {
-                                    responses::ResponseFunctionOutput::Text(String::new())
-                                }
-                                other => responses::ResponseFunctionOutput::Text(other.to_string()),
+                        let output = match tool_result.content.as_slice() {
+                            [LanguageModelToolResultContent::Text(text)] => {
+                                responses::ResponseFunctionOutput::Text(text.to_string())
                             }
-                        } else {
-                            match &tool_result.content {
-                                LanguageModelToolResultContent::Text(text) => {
-                                    responses::ResponseFunctionOutput::Text(text.to_string())
-                                }
-                                LanguageModelToolResultContent::Image(image) => {
-                                    if model.supports_vision() {
-                                        responses::ResponseFunctionOutput::Content(vec![
-                                            responses::ResponseInputContent::InputImage {
-                                                image_url: Some(image.to_base64_url()),
-                                                detail: Default::default(),
-                                            },
-                                        ])
-                                    } else {
-                                        debug_panic!(
-                                            "This should be caught at {} level",
-                                            tool_result.tool_name
-                                        );
-                                        responses::ResponseFunctionOutput::Text(
-                                            "[Tool responded with an image, but this model does not support vision]".into(),
-                                        )
-                                    }
-                                }
+                            _ => {
+                                let parts = tool_result
+                                    .content
+                                    .iter()
+                                    .map(|part| match part {
+                                        LanguageModelToolResultContent::Text(text) => {
+                                            responses::ResponseInputContent::InputText {
+                                                text: text.to_string(),
+                                            }
+                                        }
+                                        LanguageModelToolResultContent::Image(image) => {
+                                            if model.supports_vision() {
+                                                responses::ResponseInputContent::InputImage {
+                                                    image_url: Some(image.to_base64_url()),
+                                                    detail: Default::default(),
+                                                }
+                                            } else {
+                                                debug_panic!(
+                                                    "This should be caught at {} level",
+                                                    tool_result.tool_name
+                                                );
+                                                responses::ResponseInputContent::InputText {
+                                                    text: "[Tool responded with an image, but this model does not support vision]".to_string(),
+                                                }
+                                            }
+                                        }
+                                    })
+                                    .collect();
+                                responses::ResponseFunctionOutput::Content(parts)
                             }
                         };
 
@@ -937,6 +1274,12 @@ fn into_copilot_responses(
             }
 
             Role::Assistant => {
+                append_reasoning_details_to_response_items(
+                    message.reasoning_details.as_deref(),
+                    &mut replayed_reasoning_item_indexes,
+                    &mut input_items,
+                );
+
                 for content in &message.content {
                     if let MessageContent::ToolUse(tool_use) = content {
                         input_items.push(responses::ResponseInputItem::FunctionCall {
@@ -944,16 +1287,7 @@ fn into_copilot_responses(
                             name: tool_use.name.to_string(),
                             arguments: tool_use.raw_input.clone(),
                             status: None,
-                        });
-                    }
-                }
-
-                for content in &message.content {
-                    if let MessageContent::RedactedThinking(data) = content {
-                        input_items.push(responses::ResponseInputItem::Reasoning {
-                            id: None,
-                            summary: Vec::new(),
-                            encrypted_content: data.clone(),
+                            thought_signature: tool_use.thought_signature.clone(),
                         });
                     }
                 }
@@ -1017,7 +1351,7 @@ fn into_copilot_responses(
 
     let mapped_tool_choice = tool_choice.map(|choice| match choice {
         LanguageModelToolChoice::Auto => responses::ToolChoice::Auto,
-        LanguageModelToolChoice::Any => responses::ToolChoice::Any,
+        LanguageModelToolChoice::Any => responses::ToolChoice::Required,
         LanguageModelToolChoice::None => responses::ToolChoice::None,
     });
 
@@ -1028,18 +1362,31 @@ fn into_copilot_responses(
         temperature,
         tools: converted_tools,
         tool_choice: mapped_tool_choice,
-        reasoning: None, // We would need to add support for setting from user settings.
+        reasoning: if thinking_allowed {
+            let effort = thinking_effort
+                .as_deref()
+                .and_then(|e| e.parse::<copilot_responses::ReasoningEffort>().ok())
+                .unwrap_or(copilot_responses::ReasoningEffort::Medium);
+            Some(copilot_responses::ReasoningConfig {
+                effort,
+                summary: Some(copilot_responses::ReasoningSummary::Detailed),
+            })
+        } else {
+            None
+        },
         include: Some(vec![
-            copilot::copilot_responses::ResponseIncludable::ReasoningEncryptedContent,
+            copilot_responses::ResponseIncludable::ReasoningEncryptedContent,
         ]),
+        store: false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copilot::copilot_responses as responses;
+    use copilot_chat::responses;
     use futures::StreamExt;
+    use serde_json::json;
 
     fn map_events(events: Vec<responses::StreamEvent>) -> Vec<LanguageModelCompletionEvent> {
         futures::executor::block_on(async {
@@ -1051,6 +1398,37 @@ mod tests {
                 .map(Result::unwrap)
                 .collect()
         })
+    }
+
+    fn test_responses_model() -> CopilotChatModel {
+        serde_json::from_value(json!({
+            "billing": {
+                "is_premium": false,
+                "multiplier": 1.0
+            },
+            "capabilities": {
+                "family": "test",
+                "limits": {
+                    "max_context_window_tokens": 128000,
+                    "max_output_tokens": 4096
+                },
+                "supports": {
+                    "streaming": true,
+                    "tool_calls": true,
+                    "parallel_tool_calls": false,
+                    "vision": false
+                },
+                "type": "chat"
+            },
+            "id": "test-model",
+            "is_chat_default": false,
+            "is_chat_fallback": false,
+            "model_picker_enabled": true,
+            "name": "Test Model",
+            "vendor": "OpenAI",
+            "supported_endpoints": ["/responses"]
+        }))
+        .expect("valid test model")
     }
 
     #[test]
@@ -1116,6 +1494,7 @@ mod tests {
                 name: "do_it".into(),
                 arguments: "{\"x\":1}".into(),
                 status: None,
+                thought_signature: None,
             },
         }];
 
@@ -1141,6 +1520,7 @@ mod tests {
                 name: "do_it".into(),
                 arguments: "{not json}".into(),
                 status: None,
+                thought_signature: None,
             },
         }];
 
@@ -1176,10 +1556,134 @@ mod tests {
             mapped[0],
             LanguageModelCompletionEvent::Thinking { ref text, signature: None } if text == "Chain"
         ));
-        assert!(matches!(
-            mapped[1],
-            LanguageModelCompletionEvent::RedactedThinking { ref data } if data == "ENC"
-        ));
+        match &mapped[1] {
+            LanguageModelCompletionEvent::ReasoningDetails(details) => assert_eq!(
+                details,
+                &json!({
+                    "reasoning_items": [
+                        {
+                            "id": "r1",
+                            "summary": [],
+                            "encrypted_content": "ENC"
+                        }
+                    ]
+                })
+            ),
+            other => panic!("expected reasoning details, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn responses_stream_ignores_reasoning_items_repeated_in_completed_output() {
+        let events = vec![
+            responses::StreamEvent::OutputItemDone {
+                output_index: 0,
+                sequence_number: None,
+                item: responses::ResponseOutputItem::Reasoning {
+                    id: "r1".into(),
+                    summary: Some(Vec::new()),
+                    encrypted_content: Some("ENC1".into()),
+                },
+            },
+            responses::StreamEvent::Completed {
+                response: responses::Response {
+                    output: vec![
+                        responses::ResponseOutputItem::Reasoning {
+                            id: "r1".into(),
+                            summary: Some(Vec::new()),
+                            encrypted_content: Some("ENC1".into()),
+                        },
+                        responses::ResponseOutputItem::Reasoning {
+                            id: "r2".into(),
+                            summary: Some(Vec::new()),
+                            encrypted_content: Some("ENC2".into()),
+                        },
+                    ],
+                    ..Default::default()
+                },
+            },
+        ];
+
+        let mapped = map_events(events);
+        let reasoning_details = mapped
+            .iter()
+            .filter_map(|event| match event {
+                LanguageModelCompletionEvent::ReasoningDetails(details) => Some(details),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            reasoning_details,
+            vec![&json!({
+                "reasoning_items": [
+                    {
+                        "id": "r1",
+                        "summary": [],
+                        "encrypted_content": "ENC1"
+                    }
+                ]
+            })]
+        );
+    }
+
+    #[test]
+    fn into_copilot_responses_replays_reasoning_details() {
+        let model = test_responses_model();
+        let request = LanguageModelRequest {
+            messages: vec![LanguageModelRequestMessage {
+                role: Role::Assistant,
+                content: vec![
+                    MessageContent::RedactedThinking("legacy-redacted".into()),
+                    MessageContent::Text("Done".into()),
+                ],
+                cache: false,
+                reasoning_details: Some(Arc::new(json!({
+                    "reasoning_items": [
+                        {
+                            "id": "r1",
+                            "summary": [
+                                {
+                                    "type": "summary_text",
+                                    "text": "Chain"
+                                }
+                            ],
+                            "encrypted_content": "ENC"
+                        }
+                    ]
+                }))),
+            }],
+            ..Default::default()
+        };
+
+        let serialized = serde_json::to_value(into_copilot_responses(&model, request))
+            .expect("serialized request");
+        let input = serialized["input"].as_array().expect("input items");
+
+        assert_eq!(
+            input.first(),
+            Some(&json!({
+                "type": "reasoning",
+                "id": "r1",
+                "summary": [],
+                "encrypted_content": "ENC"
+            }))
+        );
+        assert_eq!(
+            input.get(1),
+            Some(&json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "Done"
+                    }
+                ],
+                "status": "completed"
+            }))
+        );
+        assert!(!serialized.to_string().contains("legacy-redacted"));
     }
 
     #[test]
@@ -1244,6 +1748,7 @@ mod tests {
                     name: "do_it".into(),
                     arguments: "{}".into(),
                     status: None,
+                    thought_signature: None,
                 },
             },
             responses::StreamEvent::Completed {
@@ -1299,96 +1804,106 @@ mod tests {
             other => panic!("expected HttpResponseError, got {:?}", other),
         }
     }
-}
-struct ConfigurationView {
-    copilot_status: Option<copilot::Status>,
-    state: Entity<State>,
-    _subscription: Option<Subscription>,
-}
 
-impl ConfigurationView {
-    pub fn new(state: Entity<State>, cx: &mut Context<Self>) -> Self {
-        let copilot = Copilot::global(cx);
+    #[test]
+    fn chat_completions_stream_maps_reasoning_data() {
+        use copilot_chat::{
+            FunctionChunk, ResponseChoice, ResponseDelta, ResponseEvent, Role, ToolCallChunk,
+        };
 
-        Self {
-            copilot_status: copilot.as_ref().map(|copilot| copilot.read(cx).status()),
-            state,
-            _subscription: copilot.as_ref().map(|copilot| {
-                cx.observe(copilot, |this, model, cx| {
-                    this.copilot_status = Some(model.read(cx).status());
-                    cx.notify();
-                })
-            }),
-        }
-    }
-}
+        let events = vec![
+            ResponseEvent {
+                choices: vec![ResponseChoice {
+                    index: Some(0),
+                    finish_reason: None,
+                    delta: Some(ResponseDelta {
+                        content: None,
+                        role: Some(Role::Assistant),
+                        tool_calls: vec![ToolCallChunk {
+                            index: Some(0),
+                            id: Some("call_abc123".to_string()),
+                            function: Some(FunctionChunk {
+                                name: Some("list_directory".to_string()),
+                                arguments: Some("{\"path\":\"test\"}".to_string()),
+                                thought_signature: None,
+                            }),
+                        }],
+                        reasoning_opaque: Some("encrypted_reasoning_token_xyz".to_string()),
+                        reasoning_text: Some("Let me check the directory".to_string()),
+                    }),
+                    message: None,
+                }],
+                id: "chatcmpl-123".to_string(),
+                usage: None,
+            },
+            ResponseEvent {
+                choices: vec![ResponseChoice {
+                    index: Some(0),
+                    finish_reason: Some("tool_calls".to_string()),
+                    delta: Some(ResponseDelta {
+                        content: None,
+                        role: None,
+                        tool_calls: vec![],
+                        reasoning_opaque: None,
+                        reasoning_text: None,
+                    }),
+                    message: None,
+                }],
+                id: "chatcmpl-123".to_string(),
+                usage: None,
+            },
+        ];
 
-impl Render for ConfigurationView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.state.read(cx).is_authenticated(cx) {
-            h_flex()
-                .mt_1()
-                .p_1()
-                .justify_between()
-                .rounded_md()
-                .border_1()
-                .border_color(cx.theme().colors().border)
-                .bg(cx.theme().colors().background)
-                .child(
-                    h_flex()
-                        .gap_1()
-                        .child(Icon::new(IconName::Check).color(Color::Success))
-                        .child(Label::new("Authorized")),
-                )
-                .child(
-                    Button::new("sign_out", "Sign Out")
-                        .label_size(LabelSize::Small)
-                        .on_click(|_, window, cx| {
-                            window.dispatch_action(copilot::SignOut.boxed_clone(), cx);
-                        }),
-                )
-        } else {
-            let loading_icon = Icon::new(IconName::ArrowCircle).with_rotate_animation(4);
+        let mapped = futures::executor::block_on(async {
+            map_to_language_model_completion_events(
+                Box::pin(futures::stream::iter(events.into_iter().map(Ok))),
+                true,
+            )
+            .collect::<Vec<_>>()
+            .await
+        });
 
-            const ERROR_LABEL: &str = "Copilot Chat requires an active GitHub Copilot subscription. Please ensure Copilot is configured and try again, or use a different Assistant provider.";
+        let mut has_reasoning_details = false;
+        let mut has_tool_use = false;
+        let mut reasoning_opaque_value: Option<String> = None;
+        let mut reasoning_text_value: Option<String> = None;
 
-            match &self.copilot_status {
-                Some(status) => match status {
-                    Status::Starting { task: _ } => h_flex()
-                        .gap_2()
-                        .child(loading_icon)
-                        .child(Label::new("Starting Copilot…")),
-                    Status::SigningIn { prompt: _ }
-                    | Status::SignedOut {
-                        awaiting_signing_in: true,
-                    } => h_flex()
-                        .gap_2()
-                        .child(loading_icon)
-                        .child(Label::new("Signing into Copilot…")),
-                    Status::Error(_) => {
-                        const LABEL: &str = "Copilot had issues starting. Please try restarting it. If the issue persists, try reinstalling Copilot.";
-                        v_flex()
-                            .gap_6()
-                            .child(Label::new(LABEL))
-                            .child(svg().size_8().path(IconName::CopilotError.path()))
-                    }
-                    _ => {
-                        const LABEL: &str = "To use Zed's agent with GitHub Copilot, you need to be logged in to GitHub. Note that your GitHub account must have an active Copilot Chat subscription.";
-
-                        v_flex().gap_2().child(Label::new(LABEL)).child(
-                            Button::new("sign_in", "Sign in to use GitHub Copilot")
-                                .full_width()
-                                .style(ButtonStyle::Outlined)
-                                .icon_color(Color::Muted)
-                                .icon(IconName::Github)
-                                .icon_position(IconPosition::Start)
-                                .icon_size(IconSize::Small)
-                                .on_click(|_, window, cx| copilot::initiate_sign_in(window, cx)),
-                        )
-                    }
-                },
-                None => v_flex().gap_6().child(Label::new(ERROR_LABEL)),
+        for event_result in mapped {
+            match event_result {
+                Ok(LanguageModelCompletionEvent::ReasoningDetails(details)) => {
+                    has_reasoning_details = true;
+                    reasoning_opaque_value = details
+                        .get("reasoning_opaque")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    reasoning_text_value = details
+                        .get("reasoning_text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                }
+                Ok(LanguageModelCompletionEvent::ToolUse(tool_use)) => {
+                    has_tool_use = true;
+                    assert_eq!(tool_use.id.to_string(), "call_abc123");
+                    assert_eq!(tool_use.name.as_ref(), "list_directory");
+                }
+                _ => {}
             }
         }
+
+        assert!(
+            has_reasoning_details,
+            "Should emit ReasoningDetails event for Gemini 3 reasoning"
+        );
+        assert!(has_tool_use, "Should emit ToolUse event");
+        assert_eq!(
+            reasoning_opaque_value,
+            Some("encrypted_reasoning_token_xyz".to_string()),
+            "Should capture reasoning_opaque"
+        );
+        assert_eq!(
+            reasoning_text_value,
+            Some("Let me check the directory".to_string()),
+            "Should capture reasoning_text"
+        );
     }
 }

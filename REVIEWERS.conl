@@ -8,107 +8,119 @@
 ; to other areas too.
 
 <all>
+  = @cole-miller
   = @ConradIrwin
-  = @maxdeviant
-  = @SomeoneToIgnore
-  = @probably-neb
   = @danilo-leal
-  = @Veykril
+  = @dinocosta
   = @kubkon
-  = @p1n3appl3
-  = @dinocosta
-  = @smitbarmase
-  = @cole-miller
-  = @HactarCE
-
-vim
-  = @ConradIrwin
+  = @maxdeviant
   = @probably-neb
-  = @p1n3appl3
-  = @dinocosta
-
-gpui
-  = @mikayla-maki
-
-git
-  = @cole-miller
-  = @danilo-leal
-
-linux
-  = @dvdsk
   = @smitbarmase
-  = @p1n3appl3
-  = @cole-miller
-  = @probably-neb
-
-windows
-  = @reflectronic
-  = @localcc
-
-pickers
-  = @p1n3appl3
-  = @dvdsk
   = @SomeoneToIgnore
+  = @Veykril
+
+ai
+  = @benbrandt
+  = @bennetbo
+  = @danilo-leal
+  = @rtfeldman
 
 audio
-  = @dvdsk
+  = @yara-blue
 
-helix
-  = @kubkon
-
-terminal
-  = @kubkon
+crashes
   = @Veykril
 
 debugger
+  = @Anthony-Eid
   = @kubkon
   = @osiewicz
-  = @Anthony-Eid
+
+design
+  = @danilo-leal
+
+docs
+  = @miguelraz
+  = @probably-neb
+  = @yeskunall
 
 extension
   = @kubkon
 
-settings_ui
-  = @probably-neb
+git
+  = @cole-miller
   = @danilo-leal
+  = @yara-blue
+  = @kubkon
   = @Anthony-Eid
+  = @cameron1024
 
-crashes
-  = @p1n3appl3
+gpui
+  = @Anthony-Eid
+  = @cameron1024
+  = @mikayla-maki
+  = @probably-neb
+
+helix
+  = @kubkon
+
+languages
+  = @osiewicz
+  = @probably-neb
+  = @smitbarmase
+  = @SomeoneToIgnore
   = @Veykril
 
-ai
-  = @rtfeldman
-  = @danilo-leal
-  = @benbrandt
-  = @bennetbo
+linux
+  = @cole-miller
+  = @yara-blue
+  = @probably-neb
+  = @smitbarmase
 
-design
-  = @danilo-leal
+lsp
+  = @osiewicz
+  = @smitbarmase
+  = @SomeoneToIgnore
+  = @Veykril
 
 multi_buffer
   = @Veykril
   = @SomeoneToIgnore
 
-lsp
-  = @osiewicz
-  = @Veykril
-  = @smitbarmase
+pickers
+  = @yara-blue
   = @SomeoneToIgnore
-
-languages
-  = @osiewicz
-  = @Veykril
-  = @smitbarmase
-  = @SomeoneToIgnore
-  = @probably-neb
 
 project_panel
   = @smitbarmase
+
+settings_ui
+  = @Anthony-Eid
+  = @danilo-leal
+  = @probably-neb
+
+sum_tree
+  = @Veykril
+
+support
+  = @miguelraz
 
 tasks
   = @SomeoneToIgnore
   = @Veykril
 
-docs
+terminal
+  = @kubkon
+  = @Veykril
+
+text
+  = @Veykril
+
+vim
+  = @ConradIrwin
+  = @dinocosta
   = @probably-neb
+
+windows
+  = @reflectronic
+  = @Veykril

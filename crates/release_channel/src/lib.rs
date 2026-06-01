@@ -4,7 +4,10 @@
 
 use std::{env, str::FromStr, sync::LazyLock};
 
-use gpui::{App, Global, SemanticVersion};
+use gpui::{App, Global};
+use semver::Version;
+
+const ZED_DOCS_URL: &str = "https://zed.dev/docs";
 
 /// stable | dev | nightly | preview
 pub static RELEASE_CHANNEL_NAME: LazyLock<String> = LazyLock::new(|| {
@@ -70,7 +73,7 @@ impl AppCommitSha {
     }
 }
 
-struct GlobalAppVersion(SemanticVersion);
+struct GlobalAppVersion(Version);
 
 impl Global for GlobalAppVersion {}
 
@@ -79,20 +82,40 @@ pub struct AppVersion;
 
 impl AppVersion {
     /// Load the app version from env.
-    pub fn load(pkg_version: &str) -> SemanticVersion {
-        if let Ok(from_env) = env::var("ZED_APP_VERSION") {
+    pub fn load(
+        pkg_version: &str,
+        build_id: Option<&str>,
+        commit_sha: Option<AppCommitSha>,
+    ) -> Version {
+        let mut version: Version = if let Ok(from_env) = env::var("ZED_APP_VERSION") {
             from_env.parse().expect("invalid ZED_APP_VERSION")
         } else {
             pkg_version.parse().expect("invalid version in Cargo.toml")
+        };
+        let mut pre = String::from(RELEASE_CHANNEL.dev_name());
+
+        if let Some(build_id) = build_id {
+            pre.push('.');
+            pre.push_str(&build_id);
         }
+
+        if let Some(sha) = commit_sha {
+            pre.push('.');
+            pre.push_str(&sha.0);
+        }
+        if let Ok(build) = semver::BuildMetadata::new(&pre) {
+            version.build = build;
+        }
+
+        version
     }
 
     /// Returns the global version number.
-    pub fn global(cx: &App) -> SemanticVersion {
+    pub fn global(cx: &App) -> Version {
         if cx.has_global::<GlobalAppVersion>() {
-            cx.global::<GlobalAppVersion>().0
+            cx.global::<GlobalAppVersion>().0.clone()
         } else {
-            SemanticVersion::default()
+            Version::new(0, 0, 0)
         }
     }
 }
@@ -121,12 +144,34 @@ struct GlobalReleaseChannel(ReleaseChannel);
 impl Global for GlobalReleaseChannel {}
 
 /// Initializes the release channel.
-pub fn init(app_version: SemanticVersion, cx: &mut App) {
+pub fn init(app_version: Version, cx: &mut App) {
     cx.set_global(GlobalAppVersion(app_version));
     cx.set_global(GlobalReleaseChannel(*RELEASE_CHANNEL))
 }
 
+/// Initializes the release channel for tests that rely on fake release channel.
+pub fn init_test(app_version: Version, release_channel: ReleaseChannel, cx: &mut App) {
+    cx.set_global(GlobalAppVersion(app_version));
+    cx.set_global(GlobalReleaseChannel(release_channel))
+}
+
+/// Returns the Zed docs URL for the current release channel for the given
+/// `slug`.
+pub fn docs_url(slug: &str, cx: &App) -> String {
+    ReleaseChannel::try_global(cx)
+        .unwrap_or(*RELEASE_CHANNEL)
+        .docs_url(slug)
+}
+
 impl ReleaseChannel {
+    /// All release channels.
+    pub const ALL: [ReleaseChannel; 4] = [
+        ReleaseChannel::Dev,
+        ReleaseChannel::Nightly,
+        ReleaseChannel::Preview,
+        ReleaseChannel::Stable,
+    ];
+
     /// Returns the global [`ReleaseChannel`].
     pub fn global(cx: &App) -> Self {
         cx.global::<GlobalReleaseChannel>().0
@@ -184,6 +229,23 @@ impl ReleaseChannel {
             Self::Stable => None,
         }
     }
+
+    /// Returns the Zed docs URL for this [`ReleaseChannel`] for the given
+    /// `slug`.
+    pub fn docs_url(&self, slug: &str) -> String {
+        let channel_path_segment = match self {
+            Self::Dev | Self::Nightly => Some("nightly"),
+            Self::Preview => Some("preview"),
+            Self::Stable => None,
+        };
+
+        match channel_path_segment {
+            Some(channel) if slug.is_empty() => format!("{ZED_DOCS_URL}/{channel}"),
+            Some(channel) => format!("{ZED_DOCS_URL}/{channel}/{slug}"),
+            None if slug.is_empty() => ZED_DOCS_URL.to_string(),
+            None => format!("{ZED_DOCS_URL}/{slug}"),
+        }
+    }
 }
 
 /// Error indicating that release channel string does not match any known release channel names.
@@ -201,5 +263,30 @@ impl FromStr for ReleaseChannel {
             "stable" => ReleaseChannel::Stable,
             _ => return Err(InvalidReleaseChannel),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ReleaseChannel;
+
+    #[test]
+    fn test_docs_url_for_release_channel() {
+        assert_eq!(
+            ReleaseChannel::Dev.docs_url("settings"),
+            "https://zed.dev/docs/nightly/settings"
+        );
+        assert_eq!(
+            ReleaseChannel::Nightly.docs_url("settings"),
+            "https://zed.dev/docs/nightly/settings"
+        );
+        assert_eq!(
+            ReleaseChannel::Preview.docs_url("settings"),
+            "https://zed.dev/docs/preview/settings"
+        );
+        assert_eq!(
+            ReleaseChannel::Stable.docs_url("settings"),
+            "https://zed.dev/docs/settings"
+        );
     }
 }

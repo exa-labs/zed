@@ -1,15 +1,97 @@
-use agent_client_protocol as acp;
+use agent_client_protocol::schema as acp;
 use anyhow::Result;
 use futures::{FutureExt as _, future::Shared};
 use gpui::{App, AppContext, AsyncApp, Context, Entity, Task};
 use language::LanguageRegistry;
 use markdown::Markdown;
 use project::Project;
-use settings::{Settings as _, SettingsLocation};
-use std::{path::PathBuf, process::ExitStatus, sync::Arc, time::Instant};
+use std::{
+    path::PathBuf,
+    process::ExitStatus,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Instant,
+};
 use task::Shell;
-use terminal::terminal_settings::TerminalSettings;
 use util::get_default_system_shell_preferring_bash;
+
+/// Request to run a terminal command inside an OS-level sandbox.
+///
+/// Passed to [`super::AcpThread::create_terminal`]. The actual sandboxing
+/// mechanism is platform-specific (today: macOS Seatbelt; nothing on other
+/// platforms — the wrap is silently a no-op there), so callers describe the
+/// *intent* with plain data here rather than constructing platform-specific
+/// types directly.
+///
+/// All-zero defaults are the fully-sandboxed run. Setting `allow_network` /
+/// `allow_fs_write` requests a relaxation; the caller is responsible for
+/// having obtained user approval before reaching this point.
+#[derive(Clone, Debug, Default)]
+pub struct SandboxWrap {
+    /// Directory subtrees the sandbox should allow writes to. Pass the
+    /// project's worktree paths (and any per-command scratch directory)
+    /// here — *not* the command's working directory, which is model-
+    /// controlled and would let the model widen its own writable scope.
+    pub writable_paths: Vec<PathBuf>,
+    /// Allow outbound network access for this command.
+    pub allow_network: bool,
+    /// Allow unrestricted filesystem writes (ignores `writable_paths`).
+    pub allow_fs_write: bool,
+}
+
+/// Opaque RAII handle the sandbox implementation hands back to keep its
+/// per-command resources (e.g. an on-disk Seatbelt config file) alive for
+/// the duration of the spawned command. `Terminal` holds it in a field
+/// whose only job is to drop with the entity.
+pub type SandboxConfigHandle = Box<dyn std::any::Any + Send>;
+
+/// Apply a [`SandboxWrap`] to a `(program, args)` pair, substituting the
+/// platform's sandbox-launcher invocation in place of the original. The
+/// returned `SandboxConfigHandle` (when `Some`) must be kept alive for the
+/// duration of the spawned command — dropping it deletes any on-disk
+/// config the launcher reads at startup.
+///
+/// On non-macOS hosts this is a no-op: the inputs pass through unchanged
+/// and the returned handle is `None`. (We don't yet have a sandbox
+/// integration for other platforms.)
+pub(crate) fn apply_sandbox_wrap(
+    program: String,
+    args: Vec<String>,
+    sandbox_wrap: Option<SandboxWrap>,
+) -> anyhow::Result<(String, Vec<String>, Option<SandboxConfigHandle>)> {
+    let Some(sandbox_wrap) = sandbox_wrap else {
+        return Ok((program, args, None));
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        let writable: Vec<&std::path::Path> = sandbox_wrap
+            .writable_paths
+            .iter()
+            .map(|p| p.as_path())
+            .collect();
+        let permissions = sandbox::macos_seatbelt::SandboxPermissions {
+            allow_network: sandbox_wrap.allow_network,
+            allow_fs_write: sandbox_wrap.allow_fs_write,
+        };
+        let (new_program, new_args, config_file) =
+            sandbox::macos_seatbelt::wrap_invocation(&program, &args, &writable, permissions)?;
+        Ok((
+            new_program,
+            new_args,
+            Some(Box::new(config_file) as SandboxConfigHandle),
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // No sandbox integration available; ignore the wrap request and
+        // let the command run with the agent's ambient permissions.
+        let _ = sandbox_wrap;
+        Ok((program, args, None))
+    }
+}
 
 pub struct Terminal {
     id: acp::TerminalId,
@@ -20,6 +102,14 @@ pub struct Terminal {
     output: Option<TerminalOutput>,
     output_byte_limit: Option<usize>,
     _output_task: Shared<Task<acp::TerminalExitStatus>>,
+    /// Flag indicating whether this terminal was stopped by explicit user action
+    /// (e.g., clicking the Stop button). This is set before kill() is called
+    /// so that code awaiting wait_for_exit() can check it deterministically.
+    user_stopped: Arc<AtomicBool>,
+    /// RAII handle kept alive for the duration of the sandboxed command.
+    /// `None` when the command isn't sandboxed (the common case for
+    /// terminals not created by the agent).
+    _sandbox_config: Option<SandboxConfigHandle>,
 }
 
 pub struct TerminalOutput {
@@ -38,11 +128,13 @@ impl Terminal {
         output_byte_limit: Option<usize>,
         terminal: Entity<terminal::Terminal>,
         language_registry: Arc<LanguageRegistry>,
+        sandbox_config: Option<SandboxConfigHandle>,
         cx: &mut Context<Self>,
     ) -> Self {
         let command_task = terminal.read(cx).wait_for_completed_task(cx);
         Self {
             id,
+            _sandbox_config: sandbox_config,
             command: cx.new(|cx| {
                 Markdown::new(
                     format!("```\n{}\n```", command_label).into(),
@@ -56,6 +148,7 @@ impl Terminal {
             started_at: Instant::now(),
             output: None,
             output_byte_limit,
+            user_stopped: Arc::new(AtomicBool::new(false)),
             _output_task: cx
                 .spawn(async move |this, cx| {
                     let exit_status = command_task.await;
@@ -77,11 +170,9 @@ impl Terminal {
 
                     let exit_status = exit_status.map(portable_pty::ExitStatus::from);
 
-                    acp::TerminalExitStatus {
-                        exit_code: exit_status.as_ref().map(|e| e.exit_code()),
-                        signal: exit_status.and_then(|e| e.signal().map(Into::into)),
-                        meta: None,
-                    }
+                    acp::TerminalExitStatus::new()
+                        .exit_code(exit_status.as_ref().map(|e| e.exit_code()))
+                        .signal(exit_status.and_then(|e| e.signal().map(ToOwned::to_owned)))
                 })
                 .shared(),
         }
@@ -101,29 +192,35 @@ impl Terminal {
         });
     }
 
+    /// Marks this terminal as stopped by user action and then kills it.
+    /// This should be called when the user explicitly clicks a Stop button.
+    pub fn stop_by_user(&mut self, cx: &mut App) {
+        self.user_stopped.store(true, Ordering::SeqCst);
+        self.kill(cx);
+    }
+
+    /// Returns whether this terminal was stopped by explicit user action.
+    pub fn was_stopped_by_user(&self) -> bool {
+        self.user_stopped.load(Ordering::SeqCst)
+    }
+
     pub fn current_output(&self, cx: &App) -> acp::TerminalOutputResponse {
         if let Some(output) = self.output.as_ref() {
             let exit_status = output.exit_status.map(portable_pty::ExitStatus::from);
 
-            acp::TerminalOutputResponse {
-                output: output.content.clone(),
-                truncated: output.original_content_len > output.content.len(),
-                exit_status: Some(acp::TerminalExitStatus {
-                    exit_code: exit_status.as_ref().map(|e| e.exit_code()),
-                    signal: exit_status.and_then(|e| e.signal().map(Into::into)),
-                    meta: None,
-                }),
-                meta: None,
-            }
+            acp::TerminalOutputResponse::new(
+                output.content.clone(),
+                output.original_content_len > output.content.len(),
+            )
+            .exit_status(
+                acp::TerminalExitStatus::new()
+                    .exit_code(exit_status.as_ref().map(|e| e.exit_code()))
+                    .signal(exit_status.and_then(|e| e.signal().map(ToOwned::to_owned))),
+            )
         } else {
             let (current_content, original_len) = self.truncated_output(cx);
-
-            acp::TerminalOutputResponse {
-                truncated: current_content.len() < original_len,
-                output: current_content,
-                exit_status: None,
-                meta: None,
-            }
+            let truncated = current_content.len() < original_len;
+            acp::TerminalOutputResponse::new(current_content, truncated)
         }
     }
 
@@ -150,6 +247,12 @@ impl Terminal {
 
     pub fn command(&self) -> &Entity<Markdown> {
         &self.command
+    }
+
+    pub fn update_command_label(&self, label: &str, cx: &mut App) {
+        self.command.update(cx, |command, cx| {
+            command.replace(format!("```\n{}\n```", label), cx);
+        });
     }
 
     pub fn working_dir(&self) -> &Option<PathBuf> {
@@ -187,26 +290,20 @@ pub async fn create_terminal_entity(
     let mut env = if let Some(dir) = &cwd {
         project
             .update(cx, |project, cx| {
-                let worktree = project.find_worktree(dir.as_path(), cx);
-                let shell = TerminalSettings::get(
-                    worktree.as_ref().map(|(worktree, path)| SettingsLocation {
-                        worktree_id: worktree.read(cx).id(),
-                        path: &path,
-                    }),
-                    cx,
-                )
-                .shell
-                .clone();
-                project.directory_environment(&shell, dir.clone().into(), cx)
-            })?
+                project.environment().update(cx, |env, cx| {
+                    env.directory_environment(dir.clone().into(), cx)
+                })
+            })
             .await
             .unwrap_or_default()
     } else {
         Default::default()
     };
 
-    // Disables paging for `git` and hopefully other commands
+    // Disable pagers so agent/terminal commands don't hang behind interactive UIs
     env.insert("PAGER".into(), "".into());
+    // Override user core.pager (e.g. delta) which Git prefers over PAGER
+    env.insert("GIT_PAGER".into(), "cat".into());
     env.extend(env_vars);
 
     // Use remote shell or default system shell, as appropriate
@@ -216,11 +313,9 @@ pub async fn create_terminal_entity(
                 .remote_client()
                 .and_then(|r| r.read(cx).default_system_shell())
                 .map(Shell::Program)
-        })?
+        })
         .unwrap_or_else(|| Shell::Program(get_default_system_shell_preferring_bash()));
-    let is_windows = project
-        .read_with(cx, |project, cx| project.path_style(cx).is_windows())
-        .unwrap_or(cfg!(windows));
+    let is_windows = project.read_with(cx, |project, cx| project.path_style(cx).is_windows());
     let (task_command, task_args) = task::ShellBuilder::new(&shell, is_windows)
         .redirect_stdin_to_dev_null()
         .build(Some(command.clone()), &args);
@@ -237,6 +332,6 @@ pub async fn create_terminal_entity(
                 },
                 cx,
             )
-        })?
+        })
         .await
 }
