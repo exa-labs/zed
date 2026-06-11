@@ -16,7 +16,7 @@ use language::{Buffer, BufferEditSource, BufferEvent, LanguageRegistry};
 use language_model::LanguageModelToolResultContent;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
 use project::{AgentLocation, Project, ProjectPath};
-use reindent::{Reindenter, compute_indent_delta};
+use reindent::{IndentDelta, Reindenter, compute_indent_delta};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::ops::Range;
@@ -524,22 +524,30 @@ impl EditPipeline {
 
                 let snapshot = buffer.read_with(cx, |buffer, _cx| buffer.snapshot());
 
-                let line = snapshot.offset_to_point(range.start).row;
+                let match_start = snapshot.offset_to_point(range.start);
+                let line = match_start.row;
                 event_stream.update_fields(
                     ToolCallUpdateFields::new()
                         .locations(vec![ToolCallLocation::new(abs_path).line(Some(line))]),
                 );
 
-                let buffer_indent = snapshot.line_indent_for_row(line);
-                let query_indent = text::LineIndent::from_iter(
-                    matcher
-                        .query_lines()
-                        .first()
-                        .map(|s| s.as_str())
-                        .unwrap_or("")
-                        .chars(),
-                );
-                let indent_delta = compute_indent_delta(buffer_indent, query_indent);
+                // Reindenting only makes sense for matches that start at a
+                // line boundary; an indent delta computed for a mid-line match
+                // would corrupt the replacement.
+                let indent_delta = if match_start.column == 0 {
+                    let buffer_indent = snapshot.line_indent_for_row(line);
+                    let query_indent = text::LineIndent::from_iter(
+                        matcher
+                            .query_lines()
+                            .first()
+                            .map(|s| s.as_str())
+                            .unwrap_or("")
+                            .chars(),
+                    );
+                    compute_indent_delta(buffer_indent, query_indent)
+                } else {
+                    IndentDelta::Spaces(0)
+                };
 
                 let old_text_in_buffer = snapshot.text_for_range(range.clone()).collect::<String>();
 
