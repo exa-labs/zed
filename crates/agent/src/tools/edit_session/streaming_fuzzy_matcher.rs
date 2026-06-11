@@ -9,6 +9,7 @@ const DELETION_COST: u32 = 10;
 /// and return the best match found so far at each step.
 pub struct StreamingFuzzyMatcher {
     snapshot: TextBufferSnapshot,
+    raw_query: String,
     query_lines: Vec<String>,
     line_hint: Option<u32>,
     incomplete_line: String,
@@ -21,6 +22,7 @@ impl StreamingFuzzyMatcher {
         let buffer_line_count = snapshot.max_point().row as usize + 1;
         Self {
             snapshot,
+            raw_query: String::new(),
             query_lines: Vec::new(),
             line_hint: None,
             incomplete_line: String::new(),
@@ -45,6 +47,7 @@ impl StreamingFuzzyMatcher {
     /// query so far, or `None` if no suitable match exists yet.
     pub fn push(&mut self, chunk: &str, line_hint: Option<u32>) -> Option<Range<usize>> {
         // Add the chunk to our incomplete line buffer
+        self.raw_query.push_str(chunk);
         self.incomplete_line.push_str(chunk);
         self.line_hint = line_hint;
 
@@ -88,7 +91,25 @@ impl StreamingFuzzyMatcher {
             self.incomplete_line.clear();
             self.matches = self.resolve_location_fuzzy();
         }
+        if self.matches.is_empty() {
+            self.matches = self.resolve_location_exact();
+        }
         self.matches.clone()
+    }
+
+    /// Find exact occurrences of the full query as a substring of the buffer.
+    ///
+    /// The line-based fuzzy matcher can't match a query that is a mid-line
+    /// substring of a longer buffer line, so this is used as a fallback when
+    /// it finds nothing.
+    fn resolve_location_exact(&self) -> Vec<Range<usize>> {
+        if self.raw_query.trim().is_empty() {
+            return Vec::new();
+        }
+        let text = self.snapshot.text();
+        text.match_indices(self.raw_query.as_str())
+            .map(|(start, _)| start..start + self.raw_query.len())
+            .collect()
     }
 
     fn resolve_location_fuzzy(&mut self) -> Vec<Range<usize>> {
@@ -780,6 +801,74 @@ mod tests {
             "}\n\n\n\nfn render_search",
             "Match should include the render_search line",
         );
+    }
+
+    #[test]
+    fn test_exact_substring_within_longer_line() {
+        let buffer = TextBuffer::new(
+            ReplicaId::LOCAL,
+            BufferId::new(1).unwrap(),
+            indoc! {"
+                # Daily note
+
+                The results of this eval, the repro v9 baseline, and the prod baseline ([[]]).
+
+                More prose follows here.
+            "},
+        );
+        let snapshot = buffer.snapshot();
+
+        let mut finder = StreamingFuzzyMatcher::new(snapshot.clone());
+        finder.push("([[]])", None);
+        let matches = finder.finish();
+
+        assert_eq!(matches.len(), 1);
+        let matched_text = snapshot
+            .text_for_range(matches[0].clone())
+            .collect::<String>();
+        assert_eq!(matched_text, "([[]])");
+    }
+
+    #[test]
+    fn test_exact_substring_with_em_dash() {
+        let buffer = TextBuffer::new(
+            ReplicaId::LOCAL,
+            BufferId::new(1).unwrap(),
+            "See the ablations note ([[Telemachus E2 — Custom Prompt Section Ablations]]) for details.\n",
+        );
+        let snapshot = buffer.snapshot();
+
+        let mut finder = StreamingFuzzyMatcher::new(snapshot.clone());
+        finder.push(
+            "([[Telemachus E2 — Custom Prompt Section Ablations]])",
+            None,
+        );
+        let matches = finder.finish();
+
+        assert_eq!(matches.len(), 1);
+        let matched_text = snapshot
+            .text_for_range(matches[0].clone())
+            .collect::<String>();
+        assert_eq!(
+            matched_text,
+            "([[Telemachus E2 — Custom Prompt Section Ablations]])"
+        );
+    }
+
+    #[test]
+    fn test_exact_substring_multiple_occurrences() {
+        let buffer = TextBuffer::new(
+            ReplicaId::LOCAL,
+            BufferId::new(1).unwrap(),
+            "first mention of [[foo]] here\nsecond mention of [[foo]] there\n",
+        );
+        let snapshot = buffer.snapshot();
+
+        let mut finder = StreamingFuzzyMatcher::new(snapshot.clone());
+        finder.push("[[foo]]", None);
+        let matches = finder.finish();
+
+        assert_eq!(matches.len(), 2);
     }
 
     #[track_caller]
