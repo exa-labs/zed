@@ -1,0 +1,117 @@
+# Builds a release `Zed Nightly.app` for macOS (Apple Silicon) with nix on
+# GitHub-hosted runners, for the exa-labs fork. Every PR gets its own build,
+# and pushes to main / upstream-main-** get one too.
+#
+# The full nix closure is uploaded as a run artifact. To run a build locally:
+#
+#   gh run download <run-id> -R exa-labs/zed -n <artifact-name>
+#   tar xf zed-nix-cache.tar
+#   nix copy --no-check-sigs --from "file://$PWD/nix-cache" "$(cat store-path.txt)"
+#   open "$(cat store-path.txt)/Applications/Zed Nightly.app"
+#
+# If a CACHIX_AUTH_TOKEN repo secret is configured, builds are also pushed to
+# the personal cachix cache (name from the CACHIX_CACHE_NAME repo variable,
+# default "exa-zed"), so a local `cachix use <name> && nix build
+# github:exa-labs/zed/<ref>` substitutes instantly instead.
+name: build_nix_mac
+
+on:
+  pull_request:
+    branches:
+      - '**'
+  push:
+    branches:
+      - main
+      - upstream-main-**
+  workflow_dispatch:
+    inputs:
+      build_ref:
+        description: 'Ref to build (e.g. refs/pull/3/merge, a branch, or a sha). Defaults to the ref the workflow runs on.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-nix-mac-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.build_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build_nix_mac_aarch64:
+    if: github.repository_owner == 'exa-labs'
+    runs-on: macos-15
+    timeout-minutes: 350
+    env:
+      CACHIX_AUTH_TOKEN: ${{ secrets.CACHIX_AUTH_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          ref: ${{ inputs.build_ref || '' }}
+
+      - name: Install nix
+        uses: cachix/install-nix-action@02a151ada4993995686f9ed4f1be7cfbb229e56f # v31
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up cachix push (optional)
+        if: env.CACHIX_AUTH_TOKEN != ''
+        uses: cachix/cachix-action@0fc020193b5a1fa3ac4575aa3a7d3aa6a35435ad # v16
+        with:
+          name: ${{ vars.CACHIX_CACHE_NAME || 'exa-zed' }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          cachixArgs: -v
+
+      # Retries paper over transient fetch failures (e.g. crates.io 403s on
+      # fixed-output vendor derivations); completed store paths are reused.
+      - name: Build Zed (release)
+        run: |
+          set -uxo pipefail
+          for attempt in 1 2 3; do
+            if nix build .#default -L --accept-flake-config; then
+              exit 0
+            fi
+            echo "nix build failed (attempt $attempt), retrying in 30s..."
+            sleep 30
+          done
+          exit 1
+
+      - name: Export closure to file:// binary cache
+        run: |
+          set -euxo pipefail
+          STORE_PATH="$(readlink -f result)"
+          echo "$STORE_PATH" > store-path.txt
+          nix copy --to "file://$PWD/nix-cache?compression=zstd" ./result
+          tar -cf zed-nix-cache.tar nix-cache store-path.txt
+          echo "STORE_PATH=$STORE_PATH" >> "$GITHUB_ENV"
+          echo "BUILD_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Upload closure artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-nix-mac-aarch64-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            zed-nix-cache.tar
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Job summary
+        run: |
+          {
+            echo "## Zed macOS (aarch64) nix build"
+            echo
+            echo "- built ref: \`${{ inputs.build_ref || github.ref }}\` (\`$BUILD_SHA\`)"
+            echo "- store path: \`$STORE_PATH\`"
+            echo
+            echo "### Run it locally"
+            echo
+            echo '```bash'
+            echo "gh run download ${{ github.run_id }} -R ${{ github.repository }} -n zed-nix-mac-aarch64-${{ github.event.pull_request.head.sha || github.sha }}"
+            echo "tar xf zed-nix-cache.tar"
+            echo "nix copy --no-check-sigs --from \"file://\$PWD/nix-cache\" \"$STORE_PATH\""
+            echo "open \"$STORE_PATH/Applications/Zed Nightly.app\""
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
