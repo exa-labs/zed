@@ -325,6 +325,40 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_streaming_edit_mid_line_substring(cx: &mut TestAppContext) {
+        let (edit_tool, _project, _action_log, _fs, _thread) = setup_test(
+            cx,
+            json!({"note.md": "- compared against the prod baseline ([[]]).\n- second bullet\n"}),
+        )
+        .await;
+        let result = cx
+            .update(|cx| {
+                edit_tool.clone().run(
+                    ToolInput::resolved(EditFileToolInput {
+                        path: "root/note.md".into(),
+                        edits: vec![Edit {
+                            old_text: "([[]])".into(),
+                            new_text:
+                                "([[Exa 3-1 Fast Reimplementation Experiments#^e2custprompt]])"
+                                    .into(),
+                        }],
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await;
+
+        let EditFileToolOutput::Success { new_text, .. } = result.unwrap() else {
+            panic!("expected success");
+        };
+        assert_eq!(
+            new_text,
+            "- compared against the prod baseline ([[Exa 3-1 Fast Reimplementation Experiments#^e2custprompt]]).\n- second bullet\n"
+        );
+    }
+
+    #[gpui::test]
     async fn test_streaming_edit_multiple_edits(cx: &mut TestAppContext) {
         let (edit_tool, _project, _action_log, _fs, _thread) = setup_test(
             cx,
