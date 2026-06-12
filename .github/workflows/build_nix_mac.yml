@@ -63,8 +63,19 @@ jobs:
           authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
           cachixArgs: -v
 
+      # Retries paper over transient fetch failures (e.g. crates.io 403s on
+      # fixed-output vendor derivations); completed store paths are reused.
       - name: Build Zed (release)
-        run: nix build .#default -L --accept-flake-config
+        run: |
+          set -uxo pipefail
+          for attempt in 1 2 3; do
+            if nix build .#default -L --accept-flake-config; then
+              exit 0
+            fi
+            echo "nix build failed (attempt $attempt), retrying in 30s..."
+            sleep 30
+          done
+          exit 1
 
       - name: Export closure to file:// binary cache
         run: |
