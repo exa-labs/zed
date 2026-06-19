@@ -30,12 +30,22 @@ struct WysiwygFoldTag;
 
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
 const READABLE_LINE_LENGTH: u32 = 60;
+/// Serif face used for the rendered document. Charter is a high-legibility
+/// book face that ships on most systems; falls back to the platform serif when
+/// unavailable.
+const WYSIWYG_FONT_FAMILY: &str = "Bitstream Charter";
 
 pub struct MarkdownWysiwygState {
     pub active: bool,
     reparse_task: Task<()>,
     references_task: Task<()>,
-    block_ids: Vec<(CustomBlockId, Range<usize>)>,
+    /// Replace/Below blocks and the anchored buffer range each one renders.
+    /// Anchors (not offsets) are stored so that edits elsewhere in the document
+    /// shift a block's tracked range automatically; the diff in `apply_blocks`
+    /// then keeps unchanged blocks in place instead of tearing them down and
+    /// re-inserting them, which previously made the text below the cursor jump
+    /// a moment after each edit.
+    block_ids: Vec<(CustomBlockId, Range<Anchor>)>,
     references_block_ids: Vec<CustomBlockId>,
     pub cached_references: Vec<String>,
     /// References currently drawn in the "Linked Mentions" block. Used to make
@@ -46,6 +56,11 @@ pub struct MarkdownWysiwygState {
     /// during the last decoration update. Lets cursor moves update folds only
     /// for the lines whose active state changed instead of rebuilding every fold.
     previous_active_line_range: Option<Range<usize>>,
+    /// Buffer rows covered by the newest selection at the last decoration
+    /// update. Typing within a line keeps these rows constant, so this lets
+    /// `on_selection_changed` skip the (expensive) full-document reparse on
+    /// every keystroke and only reparse when the cursor actually changes lines.
+    previous_active_rows: Option<Range<u32>>,
     previous_show_gutter: Option<bool>,
     previous_show_line_numbers: Option<Option<bool>>,
     previous_soft_wrap_override: Option<Option<language::language_settings::SoftWrap>>,
@@ -65,6 +80,7 @@ impl MarkdownWysiwygState {
             cached_references: Vec::new(),
             rendered_references: Vec::new(),
             previous_active_line_range: None,
+            previous_active_rows: None,
             previous_show_gutter: None,
             previous_show_line_numbers: None,
             previous_soft_wrap_override: None,
@@ -517,8 +533,20 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
             }
             Event::End(TagEnd::Heading(_)) => {
                 if let Some((level, start)) = heading_start.take() {
+                    // The heading event range includes the trailing newline. A
+                    // Replace block built from it would extend onto the next
+                    // line's display row, so the block map would merge a run of
+                    // consecutive headings into a single block (only the first
+                    // renders). Trim the trailing line break so each heading's
+                    // range stays on its own row.
+                    let mut end = range.end.min(text.len());
+                    while end > start
+                        && matches!(text.as_bytes().get(end - 1), Some(b'\n') | Some(b'\r'))
+                    {
+                        end -= 1;
+                    }
                     headings.push(HeadingDecoration {
-                        line_range: start..range.end,
+                        line_range: start..end,
                         level,
                     });
                 }
@@ -724,7 +752,7 @@ impl Editor {
                 Some(self.soft_wrap_mode_override);
 
             self.set_text_style_refinement(TextStyleRefinement {
-                font_family: Some(SharedString::from("Liberation Serif")),
+                font_family: Some(SharedString::from(WYSIWYG_FONT_FAMILY)),
                 ..Default::default()
             });
             self.style = None;
@@ -1350,15 +1378,23 @@ fn apply_marker_folds(
         collapsed_text: Some("".into()),
     };
 
+    let bullet_color = Hsla {
+        h: 0.6,
+        s: 0.2,
+        l: 0.6,
+        a: 1.0,
+    };
     let bullet_placeholder = FoldPlaceholder {
-        render: Arc::new(|_fold_id, _range, _cx| {
+        render: Arc::new(move |_fold_id, _range, _cx| {
             gpui::div()
                 .flex()
                 .items_center()
-                .child(SharedString::from("• "))
+                .pl(gpui::px(20.0))
+                .text_color(bullet_color)
+                .child(SharedString::from("•  "))
                 .into_any_element()
         }),
-        constrain_width: true,
+        constrain_width: false,
         merge_adjacent: false,
         type_tag: Some(TypeId::of::<WysiwygFoldTag>()),
         collapsed_text: Some("• ".into()),
@@ -1430,21 +1466,31 @@ fn apply_marker_folds(
     }
 
     let quote_bar_color = Hsla {
-        h: 0.6,
-        s: 0.3,
+        h: 0.0,
+        s: 0.0,
         l: 0.5,
-        a: 0.8,
+        a: 0.45,
     };
+    // Draw the left accent as a full-line-height filled bar rather than a glyph
+    // so that consecutive quote lines join into one continuous rule, matching
+    // Obsidian. The bar is a flat (non-rounded) rule and the trailing gap
+    // separates it from the quoted text.
     let quote_placeholder = FoldPlaceholder {
         render: Arc::new(move |_fold_id, _range, _cx| {
             gpui::div()
                 .flex()
                 .items_center()
-                .text_color(quote_bar_color)
-                .child(SharedString::from("▍ "))
+                .h_full()
+                .pr(gpui::px(14.0))
+                .child(
+                    gpui::div()
+                        .w(gpui::px(3.0))
+                        .h_full()
+                        .bg(quote_bar_color),
+                )
                 .into_any_element()
         }),
-        constrain_width: true,
+        constrain_width: false,
         merge_adjacent: false,
         type_tag: Some(TypeId::of::<WysiwygFoldTag>()),
         collapsed_text: Some("▍ ".into()),
@@ -1517,13 +1563,16 @@ fn apply_blocks(
     active_range: &Range<usize>,
     cx: &mut Context<Editor>,
 ) {
-    // Collect old blocks with their ranges for smart diffing.
-    let old_blocks: Vec<(CustomBlockId, Range<usize>)> =
+    // Collect old blocks with their anchored ranges for smart diffing.
+    let old_blocks: Vec<(CustomBlockId, Range<Anchor>)> =
         editor.markdown_wysiwyg_state.block_ids.drain(..).collect();
 
-    // Build desired block properties and track their source ranges.
+    // Build desired block properties and track both the source offset range
+    // (for diffing against the freshly parsed decorations) and the anchored
+    // range (for storage, so the block tracks later edits without churn).
     let mut block_properties: Vec<BlockProperties<Anchor>> = Vec::new();
     let mut block_ranges: Vec<Range<usize>> = Vec::new();
+    let mut block_anchors: Vec<Range<Anchor>> = Vec::new();
 
     for heading in &decorations.headings {
         if range_on_cursor_line(&heading.line_range, active_range) {
@@ -1564,6 +1613,7 @@ fn apply_blocks(
         });
 
         block_ranges.push(heading.line_range.clone());
+        block_anchors.push(start..end);
         block_properties.push(BlockProperties {
             placement: BlockPlacement::Replace(start..=end),
             height: Some(1),
@@ -1686,6 +1736,7 @@ fn apply_blocks(
         });
 
         block_ranges.push(table.range.clone());
+        block_anchors.push(start..end);
         block_properties.push(BlockProperties {
             placement: BlockPlacement::Replace(start..=end),
             height: Some(row_count + 1),
@@ -1756,6 +1807,7 @@ fn apply_blocks(
         let height = 10;
 
         block_ranges.push(image.range.clone());
+        block_anchors.push(start..end);
         block_properties.push(BlockProperties {
             placement: BlockPlacement::Replace(start..=end),
             height: Some(height),
@@ -1775,6 +1827,8 @@ fn apply_blocks(
 
         let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
             let left_margin = block_context.anchor_x;
+            let rule_width =
+                (block_context.em_width * READABLE_LINE_LENGTH as f32).min(block_context.max_width);
             gpui::div()
                 .pl(left_margin)
                 .flex()
@@ -1783,7 +1837,7 @@ fn apply_blocks(
                 .child(
                     gpui::div()
                         .h(gpui::px(2.0))
-                        .w(block_context.max_width * 0.7)
+                        .w(rule_width)
                         .rounded_full()
                         .bg(Hsla {
                             h: 0.0,
@@ -1796,6 +1850,7 @@ fn apply_blocks(
         });
 
         block_ranges.push(rule.range.clone());
+        block_anchors.push(start..end);
         block_properties.push(BlockProperties {
             placement: BlockPlacement::Replace(start..=end),
             height: Some(1),
@@ -1805,16 +1860,22 @@ fn apply_blocks(
         });
     }
 
-    // Smart diff: keep blocks whose range hasn't changed, only remove/add what differs.
-    let mut kept_blocks: Vec<(CustomBlockId, Range<usize>)> = Vec::new();
+    // Smart diff: an existing block's stored anchors resolve to its current
+    // offset range, so a block whose content didn't change still matches the
+    // freshly parsed range even after edits shifted it. Such blocks are kept in
+    // place; only blocks that genuinely appeared or disappeared are inserted or
+    // removed, which keeps the layout below the cursor stable while typing.
+    let mut kept_blocks: Vec<(CustomBlockId, Range<Anchor>)> = Vec::new();
     let mut to_remove: HashSet<CustomBlockId> = HashSet::default();
     let mut new_matched: Vec<bool> = vec![false; block_ranges.len()];
 
-    for (id, old_range) in old_blocks {
+    for (id, old_anchor_range) in old_blocks {
+        let resolved =
+            old_anchor_range.start.to_offset(snapshot).0..old_anchor_range.end.to_offset(snapshot).0;
         let mut matched = false;
         for (i, new_range) in block_ranges.iter().enumerate() {
-            if !new_matched[i] && old_range == *new_range {
-                kept_blocks.push((id, old_range));
+            if !new_matched[i] && resolved == *new_range {
+                kept_blocks.push((id, old_anchor_range));
                 new_matched[i] = true;
                 matched = true;
                 break;
@@ -1836,7 +1897,7 @@ fn apply_blocks(
         .filter(|(i, _)| !new_matched[*i])
         .map(|(_, p)| p)
         .collect();
-    let new_ranges: Vec<Range<usize>> = block_ranges
+    let new_block_anchors: Vec<Range<Anchor>> = block_anchors
         .into_iter()
         .enumerate()
         .filter(|(i, _)| !new_matched[*i])
@@ -1845,8 +1906,8 @@ fn apply_blocks(
 
     if !new_properties.is_empty() {
         let new_ids = editor.insert_blocks(new_properties, None, cx);
-        for (id, range) in new_ids.into_iter().zip(new_ranges) {
-            kept_blocks.push((id, range));
+        for (id, anchor_range) in new_ids.into_iter().zip(new_block_anchors) {
+            kept_blocks.push((id, anchor_range));
         }
     }
 
@@ -2101,6 +2162,20 @@ pub fn on_selection_changed(editor: &mut Editor, window: &mut Window, cx: &mut C
     }
 
     let snapshot = editor.buffer().read(cx).snapshot(cx);
+
+    // Skip the full reparse when the selection still covers the same buffer
+    // rows. Typing extends the active line's offsets but never changes which
+    // rows are revealed, so this avoids re-parsing the document on every
+    // keystroke (the dominant source of typing lag).
+    let anchor = editor.selections.newest_anchor();
+    let head_row = snapshot.offset_to_point(anchor.head().to_offset(&snapshot)).row;
+    let tail_row = snapshot.offset_to_point(anchor.tail().to_offset(&snapshot)).row;
+    let active_rows = head_row.min(tail_row)..head_row.max(tail_row);
+    if editor.markdown_wysiwyg_state.previous_active_rows.as_ref() == Some(&active_rows) {
+        return;
+    }
+    editor.markdown_wysiwyg_state.previous_active_rows = Some(active_rows);
+
     let text = snapshot.text();
     let cursor = cursor_offset(editor, cx);
 
@@ -2111,7 +2186,9 @@ pub fn on_selection_changed(editor: &mut Editor, window: &mut Window, cx: &mut C
             if cursor == heading.line_range.start {
                 let was_block = editor.markdown_wysiwyg_state.block_ids
                     .iter()
-                    .any(|(_, range)| *range == heading.line_range);
+                    .any(|(_, anchor_range)| {
+                        anchor_range.start.to_offset(&snapshot).0 == heading.line_range.start
+                    });
                 if was_block {
                     let prefix_len = heading.level as usize;
                     let space_after = if text.as_bytes().get(heading.line_range.start + prefix_len) == Some(&b' ') {
