@@ -880,6 +880,8 @@ actions!(
         ToggleInlayHints,
         /// Toggles code lens display.
         ToggleCodeLens,
+        /// Toggles inline WYSIWYG rendering for markdown files.
+        ToggleMarkdownWysiwyg,
         /// Toggles semantic highlights display.
         ToggleSemanticHighlights,
         /// Toggles inline values display.

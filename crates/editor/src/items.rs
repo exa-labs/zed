@@ -14,8 +14,9 @@ use fs::MTime;
 use futures::{channel::oneshot, future::try_join_all};
 use git::status::GitSummary;
 use gpui::{
-    AnyElement, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, Font,
-    IntoElement, ParentElement, Pixels, SharedString, Styled, Task, WeakEntity, Window, point,
+    AnyElement, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, ExternalPaths,
+    Font, IntoElement, ParentElement, Pixels, SharedString, Styled, Task, WeakEntity, Window,
+    point,
 };
 use language::{
     Bias, Buffer, BufferRow, CharKind, CharScopeContext, HighlightedText, LocalFile, Point,
@@ -624,6 +625,34 @@ fn deserialize_anchor(anchor: proto::EditorAnchor, buffer: &MultiBufferSnapshot)
 
 impl Item for Editor {
     type Event = EditorEvent;
+
+    fn handle_drop(
+        &self,
+        active_pane: &Pane,
+        dropped: &dyn Any,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(paths) = dropped.downcast_ref::<ExternalPaths>() else {
+            return false;
+        };
+        if !self.markdown_wysiwyg_state.active {
+            return false;
+        }
+        let Some(editor_entity) = active_pane
+            .active_item()
+            .and_then(|item| item.downcast::<Editor>())
+        else {
+            return false;
+        };
+        crate::markdown_wysiwyg::try_handle_image_drop(
+            self,
+            editor_entity,
+            paths.paths(),
+            window,
+            cx,
+        )
+    }
 
     fn act_as_type<'a>(
         &'a self,

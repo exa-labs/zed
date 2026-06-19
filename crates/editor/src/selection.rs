@@ -1663,6 +1663,7 @@ impl Editor {
             }
         }
 
+        crate::markdown_wysiwyg::on_selection_changed(self, window, cx);
         cx.emit(EditorEvent::SelectionsChanged { local });
 
         let selections = &self.selections.disjoint_anchors_arc();

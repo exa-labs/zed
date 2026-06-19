@@ -263,6 +263,11 @@ impl Editor {
         if self.read_only(cx) {
             return;
         }
+        if let Some(ClipboardEntry::Image(image)) = item.entries().first()
+            && crate::markdown_wysiwyg::try_handle_image_paste(self, image, window, cx)
+        {
+            return;
+        }
         let clipboard_string = item.entries().iter().find_map(|entry| match entry {
             ClipboardEntry::String(s) => Some(s),
             _ => None,

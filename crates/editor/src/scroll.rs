@@ -920,10 +920,13 @@ impl Editor {
         // configure the editor to only display a certain number of columns. If
         // that ever happens, this could probably be removed.
         let settings = AllLanguageSettings::get_global(cx);
+        let preferred_line_length = self
+            .preferred_line_length_override
+            .unwrap_or(settings.defaults.preferred_line_length);
         if matches!(settings.defaults.soft_wrap, SoftWrap::Bounded)
-            && (settings.defaults.preferred_line_length as f64) < visible_column_count
+            && (preferred_line_length as f64) < visible_column_count
         {
-            visible_column_count = settings.defaults.preferred_line_length as f64;
+            visible_column_count = preferred_line_length as f64;
         }
 
         // If the scroll position is currently at the left edge of the document

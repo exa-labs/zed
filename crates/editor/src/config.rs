@@ -250,14 +250,15 @@ impl Editor {
     pub(super) fn soft_wrap_mode(&self, cx: &App) -> SoftWrap {
         let settings = self.buffer.read(cx).language_settings(cx);
         let mode = self.soft_wrap_mode_override.unwrap_or(settings.soft_wrap);
+        let preferred_line_length = self
+            .preferred_line_length_override
+            .unwrap_or(settings.preferred_line_length);
         match mode {
             language_settings::SoftWrap::PreferLine | language_settings::SoftWrap::None => {
                 SoftWrap::None
             }
             language_settings::SoftWrap::EditorWidth => SoftWrap::EditorWidth,
-            language_settings::SoftWrap::Bounded => {
-                SoftWrap::Bounded(settings.preferred_line_length)
-            }
+            language_settings::SoftWrap::Bounded => SoftWrap::Bounded(preferred_line_length),
         }
     }
 

@@ -64,6 +64,7 @@ menu.workspace = true
 multi_buffer.workspace = true
 ordered-float.workspace = true
 parking_lot.workspace = true
+pulldown-cmark.workspace = true
 pretty_assertions.workspace = true
 project.workspace = true
 proptest = { workspace = true, optional = true }
@@ -77,6 +78,7 @@ serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 smallvec.workspace = true
+smol.workspace = true
 snippet.workspace = true
 sum_tree.workspace = true
 task.workspace = true
