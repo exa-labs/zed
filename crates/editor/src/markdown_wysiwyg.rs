@@ -30,10 +30,37 @@ struct WysiwygFoldTag;
 
 const REPARSE_DEBOUNCE: Duration = Duration::from_millis(200);
 const READABLE_LINE_LENGTH: u32 = 60;
-/// Serif face used for the rendered document. Charter is a high-legibility
-/// book face that ships on most systems; falls back to the platform serif when
-/// unavailable.
-const WYSIWYG_FONT_FAMILY: &str = "Bitstream Charter";
+/// Primary serif family for the rendered document, chosen per-OS.
+///
+/// GPUI's font resolver only consults a font's fallback list for missing
+/// *glyphs*, not a missing *primary* family: if the primary family is absent
+/// the text silently drops to the monospace buffer font. So the primary must
+/// be a serif that ships with the host OS by default rather than a single
+/// hardcoded name (a Linux-only face like "Liberation Serif" renders as
+/// monospace on macOS, which is what made the document look like code).
+fn wysiwyg_serif_family() -> SharedString {
+    if cfg!(target_os = "macos") {
+        SharedString::new_static("Palatino")
+    } else if cfg!(target_os = "windows") {
+        SharedString::new_static("Georgia")
+    } else {
+        SharedString::new_static("DejaVu Serif")
+    }
+}
+
+/// Cross-platform serif chain used for glyph coverage when the primary family
+/// lacks a specific glyph. Unknown families are ignored by the resolver.
+fn wysiwyg_serif_fallbacks() -> gpui::FontFallbacks {
+    gpui::FontFallbacks::from_fonts(vec![
+        "Palatino".to_owned(),
+        "Hoefler Text".to_owned(),
+        "Georgia".to_owned(),
+        "Charter".to_owned(),
+        "DejaVu Serif".to_owned(),
+        "Liberation Serif".to_owned(),
+        "Times New Roman".to_owned(),
+    ])
+}
 
 pub struct MarkdownWysiwygState {
     pub active: bool,
@@ -752,7 +779,8 @@ impl Editor {
                 Some(self.soft_wrap_mode_override);
 
             self.set_text_style_refinement(TextStyleRefinement {
-                font_family: Some(SharedString::from(WYSIWYG_FONT_FAMILY)),
+                font_family: Some(wysiwyg_serif_family()),
+                font_fallbacks: Some(wysiwyg_serif_fallbacks()),
                 ..Default::default()
             });
             self.style = None;
@@ -1525,6 +1553,7 @@ fn apply_marker_folds(
                         gpui::div()
                             .flex()
                             .items_center()
+                            .font_family(wysiwyg_serif_family())
                             .text_color(color)
                             .font_weight(FontWeight::BOLD)
                             .child(label.clone())
@@ -1605,6 +1634,7 @@ fn apply_blocks(
 
             gpui::div()
                 .pl(left_margin)
+                .font_family(wysiwyg_serif_family())
                 .text_size(scaled_size)
                 .font_weight(FontWeight::BOLD)
                 .line_height(scaled_size * 1.0)
@@ -1664,6 +1694,7 @@ fn apply_blocks(
             let mut inner_table = gpui::div()
                 .flex()
                 .flex_col()
+                .font_family(wysiwyg_serif_family())
                 .border_1()
                 .border_color(border_color);
 
