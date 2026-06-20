@@ -4,7 +4,7 @@ use crate::display_map::{
 };
 use crate::{Editor, ToggleMarkdownWysiwyg};
 use gpui::{
-    App, Context, ElementId, Entity, FontStyle, FontWeight, HighlightStyle, Hsla,
+    App, AppContext as _, Context, ElementId, Entity, FontStyle, FontWeight, HighlightStyle, Hsla,
     InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
     Styled, Task, TextStyleRefinement, Window,
 };
@@ -93,6 +93,15 @@ pub struct MarkdownWysiwygState {
     previous_soft_wrap_override: Option<Option<language::language_settings::SoftWrap>>,
     /// Guard flag to prevent recursive cursor adjustment in on_selection_changed.
     adjusting_cursor: bool,
+    /// Fingerprint of the document's markdown *structure* (marker kinds, counts,
+    /// and lengths, with absolute offsets excluded) at the last decoration
+    /// rebuild. Typing plain text shifts every offset after the cursor but does
+    /// not change this fingerprint, so the debounced refresh can skip the
+    /// O(document) fold/highlight/block rebuild entirely — the already-anchored
+    /// folds, highlights, and blocks track the edit on their own. Rebuilding all
+    /// folds on every keystroke (which tears down and re-wraps the whole display
+    /// map) was the dominant source of typing lag on large documents.
+    last_structure_fingerprint: Option<u64>,
 }
 
 impl MarkdownWysiwygState {
@@ -111,6 +120,7 @@ impl MarkdownWysiwygState {
             previous_show_gutter: None,
             previous_show_line_numbers: None,
             previous_soft_wrap_override: None,
+            last_structure_fingerprint: None,
         }
     }
 }
@@ -120,6 +130,7 @@ struct InlineDecoration {
     kind: DecorationKind,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum DecorationKind {
     Bold,
     Italic,
@@ -196,6 +207,68 @@ struct MarkdownDecorations {
     callouts: Vec<CalloutDecoration>,
     horizontal_rules: Vec<HorizontalRuleDecoration>,
     ordered_list_markers: Vec<Range<usize>>,
+}
+
+impl MarkdownDecorations {
+    /// Hash of the document structure that is invariant to absolute offset
+    /// shifts. Two parses that differ only by text inserted or removed *within*
+    /// existing runs (the overwhelmingly common typing case) hash equal,
+    /// because only the kind, count, length, and rendered payload of each
+    /// marker is mixed in — never an absolute buffer offset. When this matches
+    /// the previously applied value the debounced refresh skips the full
+    /// fold/highlight/block rebuild; the anchored decorations already track the
+    /// edit, and the on-cursor-line content is handled by the cursor-move path.
+    fn structure_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+        self.inline_decorations.len().hash(&mut hasher);
+        for decoration in &self.inline_decorations {
+            decoration.kind.hash(&mut hasher);
+        }
+
+        self.headings.len().hash(&mut hasher);
+        for heading in &self.headings {
+            heading.level.hash(&mut hasher);
+        }
+
+        self.tables.len().hash(&mut hasher);
+        for table in &self.tables {
+            table.headers.len().hash(&mut hasher);
+            table.rows.len().hash(&mut hasher);
+        }
+
+        self.images.len().hash(&mut hasher);
+
+        self.syntax_markers.len().hash(&mut hasher);
+        for marker in &self.syntax_markers {
+            (marker.range.end - marker.range.start).hash(&mut hasher);
+        }
+
+        self.list_items.len().hash(&mut hasher);
+        self.external_links.len().hash(&mut hasher);
+
+        self.task_checkboxes.len().hash(&mut hasher);
+        for task in &self.task_checkboxes {
+            task.checked.hash(&mut hasher);
+        }
+
+        self.blockquotes.len().hash(&mut hasher);
+
+        self.callouts.len().hash(&mut hasher);
+        for callout in &self.callouts {
+            callout.kind.hash(&mut hasher);
+        }
+
+        self.horizontal_rules.len().hash(&mut hasher);
+
+        self.ordered_list_markers.len().hash(&mut hasher);
+        for marker in &self.ordered_list_markers {
+            (marker.end - marker.start).hash(&mut hasher);
+        }
+
+        hasher.finish()
+    }
 }
 
 fn parse_options() -> Options {
@@ -840,12 +913,49 @@ pub fn schedule_wysiwyg_refresh(editor: &mut Editor, cx: &mut Context<Editor>) {
     }
 
     editor.markdown_wysiwyg_state.reparse_task = cx.spawn(async move |editor, cx| {
-        cx.background_executor()
-            .timer(REPARSE_DEBOUNCE)
+        cx.background_executor().timer(REPARSE_DEBOUNCE).await;
+
+        // Snapshot the text on the foreground (a cheap rope copy), then run the
+        // markdown parse on a background thread. Parsing the whole buffer on the
+        // UI thread on every edit was a large part of the per-keystroke cost.
+        let Ok(text) =
+            editor.read_with(cx, |editor, cx| editor.buffer().read(cx).snapshot(cx).text())
+        else {
+            return;
+        };
+
+        let (decorations, fingerprint, parsed_len) = cx
+            .background_spawn(async move {
+                let decorations = parse_markdown_decorations(&text);
+                let fingerprint = decorations.structure_fingerprint();
+                let parsed_len = text.len();
+                (decorations, fingerprint, parsed_len)
+            })
             .await;
+
         editor
             .update(cx, |editor, cx| {
-                refresh_wysiwyg_decorations(editor, cx);
+                if !editor.markdown_wysiwyg_state.active {
+                    return;
+                }
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                // If the buffer advanced between the background parse and now
+                // (a rare race; an edit normally cancels this task), the parsed
+                // offsets are stale, so fall back to a fresh synchronous rebuild.
+                if snapshot.len().0 != parsed_len {
+                    refresh_wysiwyg_decorations(editor, cx);
+                    return;
+                }
+                // The fold/highlight/block set only depends on the document
+                // *structure*. When that is unchanged (plain typing within an
+                // existing run), the anchored decorations already tracked the
+                // edit, so the expensive rebuild is pure churn — skip it.
+                if editor.markdown_wysiwyg_state.last_structure_fingerprint == Some(fingerprint) {
+                    return;
+                }
+                let text = snapshot.text();
+                apply_wysiwyg_decorations(editor, &snapshot, &text, &decorations, cx);
+                editor.markdown_wysiwyg_state.last_structure_fingerprint = Some(fingerprint);
             })
             .ok();
     });
@@ -859,22 +969,37 @@ fn refresh_wysiwyg_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     let snapshot = editor.buffer().read(cx).snapshot(cx);
     let text = snapshot.text();
     let decorations = parse_markdown_decorations(&text);
+    apply_wysiwyg_decorations(editor, &snapshot, &text, &decorations, cx);
+    editor.markdown_wysiwyg_state.last_structure_fingerprint =
+        Some(decorations.structure_fingerprint());
+}
+
+/// Applies a freshly parsed decoration set: re-highlights, rebuilds every fold,
+/// and re-diffs every block against the given snapshot. `text` must be the text
+/// of `snapshot` and `decorations` must have been parsed from it.
+fn apply_wysiwyg_decorations(
+    editor: &mut Editor,
+    snapshot: &MultiBufferSnapshot,
+    text: &str,
+    decorations: &MarkdownDecorations,
+    cx: &mut Context<Editor>,
+) {
     let cursor = cursor_offset(editor, cx);
     // Use the full selection range (covers all lines in a multi-line selection)
-    let active_line_range = selection_line_range(editor, &text, cx);
+    let active_line_range = selection_line_range(editor, text, cx);
 
-    apply_highlights(editor, &snapshot, &decorations, cursor, &active_line_range, cx);
+    apply_highlights(editor, snapshot, decorations, cursor, &active_line_range, cx);
     remove_stale_folds(editor, cx);
     apply_marker_folds(
         editor,
-        &snapshot,
-        &decorations,
+        snapshot,
+        decorations,
         cursor,
         &active_line_range,
         None,
         cx,
     );
-    apply_blocks(editor, &snapshot, &decorations, &active_line_range, cx);
+    apply_blocks(editor, snapshot, decorations, &active_line_range, cx);
     editor.markdown_wysiwyg_state.previous_active_line_range = Some(active_line_range);
 }
 
@@ -2185,6 +2310,7 @@ fn clear_wysiwyg_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     editor.markdown_wysiwyg_state.cached_references.clear();
     editor.markdown_wysiwyg_state.rendered_references.clear();
     editor.markdown_wysiwyg_state.previous_active_line_range = None;
+    editor.markdown_wysiwyg_state.last_structure_fingerprint = None;
 }
 
 pub fn on_selection_changed(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
@@ -2428,10 +2554,31 @@ fn prepare_dropped_image(document_dir: &Path, source: &Path) -> Option<String> {
     Some(unique_name)
 }
 
+/// Maps a window-relative position (such as the mouse location at drop time) to
+/// a multi-buffer anchor using the most recent paint layout. Returns `None`
+/// when the position is outside the editor's text area or no layout is
+/// available yet, in which case callers fall back to the current cursor.
+fn anchor_for_window_position(
+    editor: &Editor,
+    position: gpui::Point<gpui::Pixels>,
+) -> Option<Anchor> {
+    let position_map = editor.last_position_map.as_ref()?;
+    if !position_map.text_hitbox.contains(&position) {
+        return None;
+    }
+    let display_point = position_map.point_for_position(position).previous_valid;
+    Some(
+        position_map
+            .snapshot
+            .display_point_to_anchor(display_point, text::Bias::Left),
+    )
+}
+
 /// Attempts to handle image files dropped onto the editor when WYSIWYG mode is
 /// active. Dropped images are stored alongside the document and inserted as
-/// `![[file]]` wikilinks at the cursor. Returns true if at least one image was
-/// inserted (so the pane skips its default "open file" drop behavior).
+/// `![[file]]` wikilinks at the position the image was dropped. Returns true if
+/// at least one image was inserted (so the pane skips its default "open file"
+/// drop behavior).
 pub fn try_handle_image_drop(
     editor: &Editor,
     editor_entity: Entity<Editor>,
@@ -2462,10 +2609,19 @@ pub fn try_handle_image_drop(
     }
 
     let insert_text = wikilinks.join("\n");
+    // Resolve the drop location to a buffer anchor now, while the mouse is still
+    // at the drop point and the paint layout is current.
+    let drop_anchor = anchor_for_window_position(editor, window.mouse_position());
     // The drop is delivered while the editor entity is already being updated, so
     // defer the insertion until that update completes to avoid re-entrant access.
     window.defer(cx, move |window, cx| {
         editor_entity.update(cx, |editor, cx| {
+            if let Some(drop_anchor) = drop_anchor {
+                use crate::SelectionEffects;
+                editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                    selections.select_anchor_ranges([drop_anchor..drop_anchor]);
+                });
+            }
             editor.insert(&insert_text, window, cx);
             schedule_wysiwyg_refresh(editor, cx);
         });
