@@ -44,6 +44,7 @@ pub mod scroll;
 mod selections_collection;
 pub mod semantic_tokens;
 mod split;
+mod markdown_wysiwyg;
 pub mod split_editor_view;
 
 mod bookmarks;
@@ -958,6 +959,7 @@ pub struct Editor {
     inline_diagnostics: Vec<(Anchor, InlineDiagnostic)>,
     soft_wrap_mode_override: Option<language_settings::SoftWrap>,
     hard_wrap: Option<usize>,
+    preferred_line_length_override: Option<u32>,
     project: Option<Entity<Project>>,
     semantics_provider: Option<Rc<dyn SemanticsProvider>>,
     completion_provider: Option<Rc<dyn CompletionProvider>>,
@@ -1145,6 +1147,7 @@ pub struct Editor {
     inline_value_cache: InlineValueCache,
     number_deleted_lines: bool,
 
+    pub(crate) markdown_wysiwyg_state: markdown_wysiwyg::MarkdownWysiwygState,
     selection_drag_state: SelectionDragState,
     colors: Option<LspColorData>,
     code_lens: Option<CodeLensState>,
@@ -2168,6 +2171,7 @@ impl Editor {
             inline_diagnostics_update: Task::ready(()),
             inline_diagnostics: Vec::new(),
             soft_wrap_mode_override,
+            preferred_line_length_override: None,
             diagnostics_max_severity,
             hard_wrap: None,
             completion_provider: project.clone().map(|project| Rc::new(project) as _),
@@ -2380,6 +2384,7 @@ impl Editor {
             accent_data: None,
             bracket_fetched_tree_sitter_chunks: HashMap::default(),
             number_deleted_lines: false,
+            markdown_wysiwyg_state: markdown_wysiwyg::MarkdownWysiwygState::new(),
             refresh_matching_bracket_highlights_task: Task::ready(()),
             refresh_document_symbols_task: Task::ready(()).shared(),
             lsp_document_links: LspDocumentLinks::new(cx),
@@ -2521,6 +2526,8 @@ impl Editor {
                 editor.register_buffer(buffer.read(cx).remote_id(), cx);
             }
             editor.report_editor_event(ReportEditorEvent::EditorOpened, None, cx);
+
+            editor.maybe_auto_enable_wysiwyg(window, cx);
         }
 
         editor
@@ -9401,6 +9408,7 @@ impl Editor {
 
                 cx.emit(EditorEvent::BufferEdited);
                 cx.emit(SearchEvent::MatchesInvalidated);
+                markdown_wysiwyg::schedule_wysiwyg_refresh(self, cx);
 
                 let Some(project) = &self.project else { return };
                 let (telemetry, is_via_ssh) = {

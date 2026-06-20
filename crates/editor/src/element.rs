@@ -429,6 +429,7 @@ impl EditorElement {
         register_action(editor, window, Editor::toggle_relative_line_numbers);
         register_action(editor, window, Editor::toggle_indent_guides);
         register_action(editor, window, Editor::toggle_inlay_hints);
+        register_action(editor, window, Editor::toggle_markdown_wysiwyg);
         register_action(editor, window, Editor::toggle_inline_values);
         register_action(editor, window, Editor::toggle_code_lens_action);
         register_action(editor, window, Editor::toggle_semantic_highlights);
@@ -4834,12 +4835,16 @@ impl EditorElement {
     fn paint_background(&self, layout: &EditorLayout, window: &mut Window, cx: &mut App) {
         window.paint_layer(layout.hitbox.bounds, |window| {
             let scroll_top = layout.position_map.scroll_position.y;
-            let gutter_bg = cx.theme().colors().editor_gutter_background;
-            window.paint_quad(fill(layout.gutter_hitbox.bounds, gutter_bg));
-            window.paint_quad(fill(
-                layout.position_map.text_hitbox.bounds,
-                self.style.background,
-            ));
+            if layout.wysiwyg_centering_offset > Pixels::ZERO {
+                window.paint_quad(fill(layout.hitbox.bounds, self.style.background));
+            } else {
+                let gutter_bg = cx.theme().colors().editor_gutter_background;
+                window.paint_quad(fill(layout.gutter_hitbox.bounds, gutter_bg));
+                window.paint_quad(fill(
+                    layout.position_map.text_hitbox.bounds,
+                    self.style.background,
+                ));
+            }
 
             if matches!(
                 layout.mode,
@@ -4986,19 +4991,21 @@ impl EditorElement {
                     paint_highlight(range.start, range.end, color, edges);
                 }
 
-                for (guide_x, active) in layout.wrap_guides.iter() {
-                    let color = if *active {
-                        cx.theme().colors().editor_active_wrap_guide
-                    } else {
-                        cx.theme().colors().editor_wrap_guide
-                    };
-                    window.paint_quad(fill(
-                        window.pixel_snap_bounds(Bounds {
-                            origin: point(*guide_x, layout.position_map.text_hitbox.origin.y),
-                            size: size(px(1.), layout.position_map.text_hitbox.size.height),
-                        }),
-                        color,
-                    ));
+                if layout.wysiwyg_centering_offset == Pixels::ZERO {
+                    for (guide_x, active) in layout.wrap_guides.iter() {
+                        let color = if *active {
+                            cx.theme().colors().editor_active_wrap_guide
+                        } else {
+                            cx.theme().colors().editor_wrap_guide
+                        };
+                        window.paint_quad(fill(
+                            window.pixel_snap_bounds(Bounds {
+                                origin: point(*guide_x, layout.position_map.text_hitbox.origin.y),
+                                size: size(px(1.), layout.position_map.text_hitbox.size.height),
+                            }),
+                            color,
+                        ));
+                    }
                 }
             }
         })
@@ -7898,6 +7905,11 @@ impl Element for EditorElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let _prepaint_depth_guard = request_layout.increment_prepaint_depth();
+        // WYSIWYG mode shrinks `bounds` below to center the text column. The recursive
+        // re-prepaint calls (after fold/block width changes) must restart from the editor's
+        // actual allocated bounds, not the shrunk copy, or each recursion would re-center the
+        // already-centered bounds and the column would jump left mid-frame.
+        let original_prepaint_bounds = bounds;
         let text_style = TextStyleRefinement {
             font_size: Some(self.style.text.font_size),
             line_height: Some(self.style.text.line_height),
@@ -7916,6 +7928,78 @@ impl Element for EditorElement {
         let rem_size = self.rem_size(cx);
         window.with_rem_size(rem_size, |window| {
             window.with_text_style(Some(text_style), |window| {
+                let wysiwyg_is_active = self.editor.read(cx).markdown_wysiwyg_state.active;
+                let mut wysiwyg_centering_offset = Pixels::ZERO;
+                let bounds = if wysiwyg_is_active {
+                    let style = &self.style;
+                    let rem_size = window.rem_size();
+                    let font_id = window.text_system().resolve_font(&style.text.font());
+                    let font_size = style.text.font_size.to_pixels(rem_size);
+                    let em_layout_width = window.text_system().em_layout_width(font_id, font_size);
+                    let em_width = window.text_system().em_width(font_id, font_size).unwrap();
+
+                    let (gutter_dimensions, soft_wrap_mode, show_scrollbars_vertical) =
+                        self.editor.update(cx, |editor, cx| {
+                            let snapshot = editor.snapshot(window, cx);
+                            let gutter_dims =
+                                snapshot.gutter_dimensions(font_id, font_size, style, window, cx);
+                            let soft_wrap = editor.soft_wrap_mode(cx);
+                            let scrollbars_vertical = editor.show_scrollbars.vertical;
+                            (gutter_dims, soft_wrap, scrollbars_vertical)
+                        });
+                    let text_width = bounds.size.width - gutter_dimensions.width;
+
+                    let settings = EditorSettings::get_global(cx);
+                    let scrollbars_shown = settings.scrollbar.show != ShowScrollbar::Never;
+                    let vertical_scrollbar_width = (scrollbars_shown
+                        && settings.scrollbar.axes.vertical
+                        && show_scrollbars_vertical)
+                        .then_some(style.scrollbar_width)
+                        .unwrap_or_default();
+                    let minimap_width = self
+                        .get_minimap_width(
+                            &settings.minimap,
+                            scrollbars_shown,
+                            text_width,
+                            em_width,
+                            font_size,
+                            rem_size,
+                            cx,
+                        )
+                        .unwrap_or_default();
+                    let right_margin = minimap_width + vertical_scrollbar_width;
+                    let extended_right = 2 * em_width + right_margin;
+                    let preliminary_editor_width =
+                        text_width - gutter_dimensions.margin - extended_right;
+
+                    let wrap_width =
+                        calculate_wrap_width(soft_wrap_mode, preliminary_editor_width, em_layout_width);
+                    // Base the centering offset on the full text width, ignoring the auto-hiding
+                    // vertical scrollbar and minimap. Those fade in and out during scroll activity;
+                    // folding their width into the offset would slide the centered text sideways
+                    // every time they appear or hide. They overlay the right margin, which the
+                    // centered text column never reaches anyway.
+                    let centering_width = text_width - gutter_dimensions.margin - 2 * em_width;
+                    wysiwyg_centering_offset = if let Some(wrap_width) = wrap_width {
+                        (centering_width - wrap_width).max(Pixels::ZERO) / 2.0
+                    } else {
+                        Pixels::ZERO
+                    };
+
+                    Bounds {
+                        origin: point(
+                            bounds.origin.x + wysiwyg_centering_offset,
+                            bounds.origin.y,
+                        ),
+                        size: size(
+                            bounds.size.width - wysiwyg_centering_offset,
+                            bounds.size.height,
+                        ),
+                    }
+                } else {
+                    bounds
+                };
+
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
                     let (mut snapshot, is_read_only) = self.editor.update(cx, |editor, cx| {
                         (editor.snapshot(window, cx), editor.read_only(cx))
@@ -8506,7 +8590,7 @@ impl Element for EditorElement {
                         return self.prepaint(
                             None,
                             _inspector_id,
-                            bounds,
+                            original_prepaint_bounds,
                             request_layout,
                             window,
                             cx,
@@ -8639,7 +8723,7 @@ impl Element for EditorElement {
                             return self.prepaint(
                                 None,
                                 _inspector_id,
-                                bounds,
+                                original_prepaint_bounds,
                                 request_layout,
                                 window,
                                 cx,
@@ -9359,6 +9443,7 @@ impl Element for EditorElement {
                         expand_toggles,
                         text_align: self.style.text.text_align,
                         content_width: text_hitbox.size.width,
+                        wysiwyg_centering_offset,
                     }
                 })
             })
@@ -9400,6 +9485,14 @@ impl Element for EditorElement {
         window.with_rem_size(rem_size, |window| {
             window.with_text_style(Some(text_style), |window| {
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
+                    if layout.wysiwyg_centering_offset > Pixels::ZERO {
+                        let margin_bounds = Bounds {
+                            origin: bounds.origin,
+                            size: size(layout.wysiwyg_centering_offset, bounds.size.height),
+                        };
+                        window.paint_quad(fill(margin_bounds, self.style.background));
+                    }
+
                     self.paint_mouse_listeners(layout, window, cx);
 
                     // Mask the editor behind sticky scroll headers. Important
@@ -9578,6 +9671,7 @@ pub struct EditorLayout {
     document_colors: Option<(DocumentColorsRenderMode, Vec<(Range<DisplayPoint>, Hsla)>)>,
     text_align: TextAlign,
     content_width: Pixels,
+    wysiwyg_centering_offset: Pixels,
 }
 
 impl EditorLayout {
