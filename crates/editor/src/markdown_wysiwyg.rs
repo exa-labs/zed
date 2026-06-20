@@ -842,6 +842,8 @@ impl Editor {
             self.preferred_line_length_override = None;
             self.set_text_style_refinement(TextStyleRefinement::default());
             self.style = None;
+            self.display_map
+                .update(cx, |display_map, cx| display_map.set_hang_indent(false, cx));
             self.markdown_wysiwyg_state.active = false;
             WYSIWYG_GLOBALLY_ENABLED.store(false, Ordering::SeqCst);
             cx.notify();
@@ -862,6 +864,8 @@ impl Editor {
             self.soft_wrap_mode_override =
                 Some(language::language_settings::SoftWrap::Bounded);
             self.preferred_line_length_override = Some(READABLE_LINE_LENGTH);
+            self.display_map
+                .update(cx, |display_map, cx| display_map.set_hang_indent(true, cx));
             self.markdown_wysiwyg_state.active = true;
             WYSIWYG_GLOBALLY_ENABLED.store(true, Ordering::SeqCst);
             refresh_wysiwyg_decorations(self, cx);
@@ -1542,9 +1546,8 @@ fn apply_marker_folds(
             gpui::div()
                 .flex()
                 .items_center()
-                .pl(gpui::px(20.0))
                 .text_color(bullet_color)
-                .child(SharedString::from("•  "))
+                .child(SharedString::from("• "))
                 .into_any_element()
         }),
         constrain_width: false,
@@ -1935,32 +1938,77 @@ fn apply_blocks(
         let image_width = image.width;
         let image_height = image.height;
 
-        let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
-            let left_margin = block_context.anchor_x;
-            let mut image_element = if let Some(path) = &resolved_path {
-                gpui::img(path.clone())
-            } else {
-                gpui::img(SharedString::from(url.clone()))
-            };
+        let (render, height): (RenderBlock, u32) = if is_video_url(&url) {
+            let element_id: ElementId =
+                SharedString::from(format!("wysiwyg-video-embed-{}", image.range.start)).into();
+            let label = video_label(&url);
+            let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
+                let left_margin = block_context.anchor_x;
+                let colors = block_context.app.theme().colors();
+                let border_color = colors.border;
+                let background = colors.element_background;
+                let icon_color = colors.text_muted;
+                let label_color = colors.text;
+                let target_path = resolved_path.clone();
+                let target_url = url.clone();
 
-            if let Some(width) = image_width {
-                image_element = image_element.w(gpui::px(width as f32));
-            }
-            if let Some(height) = image_height {
-                image_element = image_element.h(gpui::px(height as f32));
-            }
-            if image_width.is_none() && image_height.is_none() {
-                image_element = image_element.max_w(gpui::px(300.0));
-            }
+                gpui::div()
+                    .pl(left_margin)
+                    .py_1()
+                    .child(
+                        gpui::div()
+                            .id(element_id.clone())
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .max_w(gpui::px(360.0))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border_color)
+                            .bg(background)
+                            .cursor_pointer()
+                            .child(gpui::div().text_color(icon_color).child(SharedString::from("▶")))
+                            .child(gpui::div().text_color(label_color).child(label.clone()))
+                            .on_click(move |_event, _window, cx| {
+                                if let Some(path) = &target_path {
+                                    cx.open_with_system(path);
+                                } else {
+                                    cx.open_url(&target_url);
+                                }
+                            }),
+                    )
+                    .into_any_element()
+            });
+            (render, 3)
+        } else {
+            let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
+                let left_margin = block_context.anchor_x;
+                let mut image_element = if let Some(path) = &resolved_path {
+                    gpui::img(path.clone())
+                } else {
+                    gpui::img(SharedString::from(url.clone()))
+                };
 
-            gpui::div()
-                .pl(left_margin)
-                .py_1()
-                .child(image_element)
-                .into_any_element()
-        });
+                if let Some(width) = image_width {
+                    image_element = image_element.w(gpui::px(width as f32));
+                }
+                if let Some(height) = image_height {
+                    image_element = image_element.h(gpui::px(height as f32));
+                }
+                if image_width.is_none() && image_height.is_none() {
+                    image_element = image_element.max_w(gpui::px(300.0));
+                }
 
-        let height = 10;
+                gpui::div()
+                    .pl(left_margin)
+                    .py_1()
+                    .child(image_element)
+                    .into_any_element()
+            });
+            (render, 10)
+        };
 
         block_ranges.push(image.range.clone());
         block_anchors.push(start..end);
@@ -2517,6 +2565,29 @@ fn is_image_path(path: &Path) -> bool {
                 | "tif"
         )
     )
+}
+
+/// Whether an embed reference points at a video file. GPUI has no general
+/// video-playback element (its `Surface` is a macOS-only CoreVideo buffer used
+/// for screen sharing, not a file player), so video embeds are rendered as a
+/// clickable card rather than an inline `gpui::img`, which would fail to decode.
+fn is_video_url(url: &str) -> bool {
+    let path_part = url.split('?').next().unwrap_or(url);
+    let lowercased = path_part.to_ascii_lowercase();
+    [".mov", ".mp4", ".webm", ".m4v", ".mkv"]
+        .iter()
+        .any(|extension| lowercased.ends_with(extension))
+}
+
+/// The file name shown on a video embed card, falling back to the raw reference
+/// when no file-name component can be extracted (for example a bare URL).
+fn video_label(url: &str) -> SharedString {
+    let path_part = url.split('?').next().unwrap_or(url);
+    let label = Path::new(path_part)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path_part);
+    SharedString::from(label.to_string())
 }
 
 /// Places a dropped image next to the document and returns the file name to use
