@@ -170,6 +170,7 @@ pub enum HighlightKey {
     MarkdownWysiwygStrikethrough,
     MarkdownWysiwygWikilink,
     MarkdownWysiwygUnresolvedLink,
+    MarkdownWysiwygCommentAnchor,
     MatchingBracket,
     PendingInput,
     ProjectSearchView,

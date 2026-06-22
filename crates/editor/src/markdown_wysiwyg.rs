@@ -2,7 +2,10 @@ use crate::display_map::{
     BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CustomBlockId,
     FoldPlaceholder, HighlightKey, RenderBlock,
 };
-use crate::{Editor, ToggleMarkdownWysiwyg};
+use crate::{
+    CancelMarkdownComment, CommitMarkdownComment, CreateMarkdownComment, Editor,
+    ResolveMarkdownComment, ToggleMarkdownCommentThread, ToggleMarkdownWysiwyg,
+};
 use gpui::{
     Context, ElementId, FontStyle, FontWeight, HighlightStyle, Hsla, InteractiveElement,
     IntoElement, ParentElement, SharedString, StatefulInteractiveElement, Styled, Task,
@@ -12,12 +15,14 @@ use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 use theme::ActiveTheme;
 use collections::HashSet;
+use serde::{Deserialize, Serialize};
 use std::any::TypeId;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use uuid::Uuid;
 
 /// Global flag that tracks whether WYSIWYG mode should be auto-enabled for
 /// markdown files. When the user toggles WYSIWYG on, this is set to true;
@@ -36,7 +41,9 @@ pub struct MarkdownWysiwygState {
     references_task: Task<()>,
     block_ids: Vec<CustomBlockId>,
     references_block_ids: Vec<CustomBlockId>,
+    comment_block_ids: Vec<CustomBlockId>,
     pub cached_references: Vec<String>,
+    pub comments: CommentsState,
     previous_show_gutter: Option<bool>,
     previous_show_line_numbers: Option<Option<bool>>,
     previous_soft_wrap_override: Option<Option<language::language_settings::SoftWrap>>,
@@ -50,10 +57,111 @@ impl MarkdownWysiwygState {
             references_task: Task::ready(()),
             block_ids: Vec::new(),
             references_block_ids: Vec::new(),
+            comment_block_ids: Vec::new(),
             cached_references: Vec::new(),
+            comments: CommentsState::new(),
             previous_show_gutter: None,
             previous_show_line_numbers: None,
             previous_soft_wrap_override: None,
+        }
+    }
+}
+
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommentReply {
+    pub id: String,
+    pub author: String,
+    pub content: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MarkdownComment {
+    pub id: String,
+    pub anchor_text: String,
+    pub anchor_offset: usize,
+    pub anchor_length: usize,
+    pub content: String,
+    pub author: String,
+    pub replies: Vec<CommentReply>,
+    pub created_at: String,
+    pub resolved: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CommentsFile {
+    version: u32,
+    comments: Vec<MarkdownComment>,
+}
+
+pub struct CommentsState {
+    pub comments: Vec<MarkdownComment>,
+    pub active_comment_id: Option<String>,
+    pub pending_comment_input: Option<PendingCommentInput>,
+    comments_file_path: Option<PathBuf>,
+}
+
+pub struct PendingCommentInput {
+    pub anchor_text: String,
+    pub anchor_offset: usize,
+    pub anchor_length: usize,
+    pub input_buffer: String,
+}
+
+impl CommentsState {
+    pub fn new() -> Self {
+        Self {
+            comments: Vec::new(),
+            active_comment_id: None,
+            pending_comment_input: None,
+            comments_file_path: None,
+        }
+    }
+}
+
+fn comments_file_path_for(markdown_path: &std::path::Path) -> PathBuf {
+    let file_name = markdown_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let parent = markdown_path.parent().unwrap_or(std::path::Path::new("."));
+    parent.join(format!(".{}.comments.json", file_name))
+}
+
+fn load_comments_from_file(path: &std::path::Path) -> Vec<MarkdownComment> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => match serde_json::from_str::<CommentsFile>(&content) {
+            Ok(file) => file.comments,
+            Err(_) => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save_comments_to_file(path: &std::path::Path, comments: &[MarkdownComment]) {
+    let file = CommentsFile {
+        version: 1,
+        comments: comments.to_vec(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&file) {
+        if let Err(error) = std::fs::write(path, json) {
+            log::error!("Failed to write comments file: {}", error);
+        }
+    }
+}
+
+fn re_anchor_comments(comments: &mut [MarkdownComment], text: &str) {
+    for comment in comments.iter_mut() {
+        let expected_end = comment.anchor_offset + comment.anchor_length;
+        if expected_end <= text.len()
+            && text.get(comment.anchor_offset..expected_end) == Some(&comment.anchor_text)
+        {
+            continue;
+        }
+        if let Some(pos) = text.find(&comment.anchor_text) {
+            comment.anchor_offset = pos;
+            comment.anchor_length = comment.anchor_text.len();
         }
     }
 }
@@ -520,6 +628,7 @@ impl Editor {
                 Some(language::language_settings::SoftWrap::PreferredLineLength);
             self.markdown_wysiwyg_state.active = true;
             WYSIWYG_GLOBALLY_ENABLED.store(true, Ordering::SeqCst);
+            load_comments(self, cx);
             refresh_wysiwyg_decorations(self, cx);
             fetch_references(self, cx);
         }
@@ -553,6 +662,190 @@ impl Editor {
         }
         false
     }
+
+    fn get_markdown_file_path(&self, cx: &Context<Self>) -> Option<PathBuf> {
+        let multi_buffer = self.buffer().read(cx);
+        for buffer in multi_buffer.all_buffers() {
+            let buffer_read = buffer.read(cx);
+            if let Some(file) = buffer_read.file() {
+                if let Some(local_file) = file.as_local() {
+                    return Some(local_file.abs_path(cx).to_path_buf());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn create_markdown_comment(
+        &mut self,
+        _: &CreateMarkdownComment,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.markdown_wysiwyg_state.active {
+            return;
+        }
+
+        let anchor = self.selections.newest_anchor();
+        let snapshot = self.buffer().read(cx).snapshot(cx);
+        let head_offset: usize = anchor.head().to_offset(&snapshot).0;
+        let tail_offset: usize = anchor.tail().to_offset(&snapshot).0;
+        let selection_start = head_offset.min(tail_offset);
+        let selection_end = head_offset.max(tail_offset);
+
+        if selection_start == selection_end {
+            return;
+        }
+
+        let text = snapshot.text();
+        let anchor_text = text
+            .get(selection_start..selection_end)
+            .unwrap_or_default()
+            .to_string();
+
+        self.markdown_wysiwyg_state.comments.pending_comment_input = Some(PendingCommentInput {
+            anchor_text,
+            anchor_offset: selection_start,
+            anchor_length: selection_end - selection_start,
+            input_buffer: String::new(),
+        });
+
+        refresh_wysiwyg_decorations(self, cx);
+        cx.notify();
+    }
+
+    pub fn commit_markdown_comment(
+        &mut self,
+        _: &CommitMarkdownComment,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.markdown_wysiwyg_state.active {
+            return;
+        }
+
+        let pending = match self.markdown_wysiwyg_state.comments.pending_comment_input.take() {
+            Some(p) => p,
+            None => return,
+        };
+
+        if pending.input_buffer.trim().is_empty() {
+            return;
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        let comment = MarkdownComment {
+            id: Uuid::new_v4().to_string(),
+            anchor_text: pending.anchor_text.clone(),
+            anchor_offset: pending.anchor_offset,
+            anchor_length: pending.anchor_length,
+            content: pending.input_buffer.clone(),
+            author: "user".to_string(),
+            replies: Vec::new(),
+            created_at: now,
+            resolved: false,
+        };
+
+        self.markdown_wysiwyg_state.comments.comments.push(comment.clone());
+        self.markdown_wysiwyg_state.comments.active_comment_id = Some(comment.id.clone());
+
+        if let Some(path) = &self.markdown_wysiwyg_state.comments.comments_file_path {
+            save_comments_to_file(path, &self.markdown_wysiwyg_state.comments.comments);
+        } else if let Some(md_path) = self.get_markdown_file_path(cx) {
+            let comments_path = comments_file_path_for(&md_path);
+            save_comments_to_file(&comments_path, &self.markdown_wysiwyg_state.comments.comments);
+            self.markdown_wysiwyg_state.comments.comments_file_path = Some(comments_path);
+        }
+
+        spawn_comment_agent(self, &comment, cx);
+
+        refresh_wysiwyg_decorations(self, cx);
+        cx.notify();
+    }
+
+    pub fn cancel_markdown_comment(
+        &mut self,
+        _: &CancelMarkdownComment,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.markdown_wysiwyg_state.comments.pending_comment_input = None;
+        refresh_wysiwyg_decorations(self, cx);
+        cx.notify();
+    }
+
+    pub fn resolve_markdown_comment(
+        &mut self,
+        _: &ResolveMarkdownComment,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.markdown_wysiwyg_state.active {
+            return;
+        }
+
+        let active_id = match &self.markdown_wysiwyg_state.comments.active_comment_id {
+            Some(id) => id.clone(),
+            None => return,
+        };
+
+        if let Some(comment) = self
+            .markdown_wysiwyg_state
+            .comments
+            .comments
+            .iter_mut()
+            .find(|c| c.id == active_id)
+        {
+            comment.resolved = true;
+        }
+
+        self.markdown_wysiwyg_state.comments.active_comment_id = None;
+
+        if let Some(path) = &self.markdown_wysiwyg_state.comments.comments_file_path {
+            save_comments_to_file(path, &self.markdown_wysiwyg_state.comments.comments);
+        }
+
+        refresh_wysiwyg_decorations(self, cx);
+        cx.notify();
+    }
+
+    pub fn toggle_markdown_comment_thread(
+        &mut self,
+        _: &ToggleMarkdownCommentThread,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.markdown_wysiwyg_state.active {
+            return;
+        }
+
+        let cursor = cursor_offset(self, cx);
+        let clicked_comment = self
+            .markdown_wysiwyg_state
+            .comments
+            .comments
+            .iter()
+            .find(|c| {
+                !c.resolved
+                    && cursor >= c.anchor_offset
+                    && cursor <= c.anchor_offset + c.anchor_length
+            })
+            .map(|c| c.id.clone());
+
+        if let Some(comment_id) = clicked_comment {
+            if self.markdown_wysiwyg_state.comments.active_comment_id.as_deref() == Some(&comment_id)
+            {
+                self.markdown_wysiwyg_state.comments.active_comment_id = None;
+            } else {
+                self.markdown_wysiwyg_state.comments.active_comment_id = Some(comment_id);
+            }
+        } else {
+            self.markdown_wysiwyg_state.comments.active_comment_id = None;
+        }
+
+        refresh_wysiwyg_decorations(self, cx);
+        cx.notify();
+    }
 }
 
 pub fn schedule_wysiwyg_refresh(editor: &mut Editor, cx: &mut Context<Editor>) {
@@ -580,10 +873,14 @@ fn refresh_wysiwyg_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     // Use the full selection range (covers all lines in a multi-line selection)
     let active_line_range = selection_line_range(editor, &text, cx);
 
+    re_anchor_comments(&mut editor.markdown_wysiwyg_state.comments.comments, &text);
+
     apply_highlights(editor, &snapshot, &decorations, cursor, &active_line_range, cx);
+    apply_comment_highlights(editor, &snapshot, cx);
     remove_stale_folds(editor, cx);
     apply_marker_folds(editor, &snapshot, &decorations, cursor, &active_line_range, cx);
     apply_blocks(editor, &snapshot, &decorations, &active_line_range, cx);
+    apply_comment_blocks(editor, &snapshot, cx);
 }
 
 fn apply_highlights(
@@ -1403,7 +1700,21 @@ fn clear_wysiwyg_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     if !old_ref_ids.is_empty() {
         editor.remove_blocks(old_ref_ids, None, cx);
     }
+
+    let old_comment_ids: HashSet<CustomBlockId> = editor
+        .markdown_wysiwyg_state
+        .comment_block_ids
+        .drain(..)
+        .collect();
+    if !old_comment_ids.is_empty() {
+        editor.remove_blocks(old_comment_ids, None, cx);
+    }
+
+    editor.clear_highlights(HighlightKey::MarkdownWysiwygCommentAnchor, cx);
     editor.markdown_wysiwyg_state.cached_references.clear();
+    editor.markdown_wysiwyg_state.comments.comments.clear();
+    editor.markdown_wysiwyg_state.comments.active_comment_id = None;
+    editor.markdown_wysiwyg_state.comments.pending_comment_input = None;
 }
 
 pub fn on_selection_changed(editor: &mut Editor, cx: &mut Context<Editor>) {
@@ -1527,4 +1838,442 @@ pub fn try_handle_image_paste(
     schedule_wysiwyg_refresh(editor, cx);
 
     true
+}
+
+
+fn load_comments(editor: &mut Editor, cx: &mut Context<Editor>) {
+    if let Some(md_path) = editor.get_markdown_file_path(cx) {
+        let comments_path = comments_file_path_for(&md_path);
+        let comments = load_comments_from_file(&comments_path);
+        editor.markdown_wysiwyg_state.comments.comments = comments;
+        editor.markdown_wysiwyg_state.comments.comments_file_path = Some(comments_path);
+    }
+}
+
+fn apply_comment_highlights(
+    editor: &mut Editor,
+    snapshot: &MultiBufferSnapshot,
+    cx: &mut Context<Editor>,
+) {
+    let comments = &editor.markdown_wysiwyg_state.comments.comments;
+    let mut anchor_ranges: Vec<Range<Anchor>> = Vec::new();
+
+    for comment in comments {
+        if comment.resolved {
+            continue;
+        }
+        let end_offset = comment.anchor_offset + comment.anchor_length;
+        if end_offset > snapshot.len().0 {
+            continue;
+        }
+        let start = snapshot.anchor_before(MultiBufferOffset(comment.anchor_offset));
+        let end = snapshot.anchor_after(MultiBufferOffset(end_offset));
+        anchor_ranges.push(start..end);
+    }
+
+    // Also highlight pending comment input anchor
+    if let Some(pending) = &editor.markdown_wysiwyg_state.comments.pending_comment_input {
+        let end_offset = pending.anchor_offset + pending.anchor_length;
+        if end_offset <= snapshot.len().0 {
+            let start = snapshot.anchor_before(MultiBufferOffset(pending.anchor_offset));
+            let end = snapshot.anchor_after(MultiBufferOffset(end_offset));
+            anchor_ranges.push(start..end);
+        }
+    }
+
+    set_or_clear_highlight(
+        editor,
+        HighlightKey::MarkdownWysiwygCommentAnchor,
+        anchor_ranges,
+        HighlightStyle {
+            background_color: Some(Hsla {
+                h: 0.13,
+                s: 0.7,
+                l: 0.5,
+                a: 0.15,
+            }),
+            ..Default::default()
+        },
+        cx,
+    );
+}
+
+fn apply_comment_blocks(
+    editor: &mut Editor,
+    snapshot: &MultiBufferSnapshot,
+    cx: &mut Context<Editor>,
+) {
+    let old_comment_ids: HashSet<CustomBlockId> = editor
+        .markdown_wysiwyg_state
+        .comment_block_ids
+        .drain(..)
+        .collect();
+    if !old_comment_ids.is_empty() {
+        editor.remove_blocks(old_comment_ids, None, cx);
+    }
+
+    let mut block_properties: Vec<BlockProperties<Anchor>> = Vec::new();
+
+    if let Some(pending) = &editor.markdown_wysiwyg_state.comments.pending_comment_input {
+        let end_offset = pending.anchor_offset + pending.anchor_length;
+        if end_offset <= snapshot.len().0 {
+            let anchor_text = pending.anchor_text.clone();
+            let input_buffer = pending.input_buffer.clone();
+            let end_anchor = snapshot.anchor_after(MultiBufferOffset(end_offset));
+
+            let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
+                let left_margin = block_context.anchor_x;
+                let border_color = Hsla { h: 0.13, s: 0.7, l: 0.5, a: 0.3 };
+                let bg_color = Hsla { h: 0.13, s: 0.3, l: 0.15, a: 0.9 };
+
+                let mut container = gpui::div()
+                    .pl(left_margin)
+                    .max_w(block_context.max_width * 0.6)
+                    .flex()
+                    .flex_col()
+                    .bg(bg_color)
+                    .border_1()
+                    .border_color(border_color)
+                    .rounded_md()
+                    .p_2()
+                    .mt_1()
+                    .mb_1();
+
+                container = container.child(
+                    gpui::div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .mb_1()
+                        .child(
+                            gpui::div()
+                                .text_color(Hsla { h: 0.13, s: 0.7, l: 0.6, a: 1.0 })
+                                .font_weight(FontWeight::BOLD)
+                                .text_size(block_context.em_width * 0.85)
+                                .child(SharedString::from("New Comment")),
+                        ),
+                );
+
+                let display_anchor = if anchor_text.chars().count() > 60 {
+                    let truncated: String = anchor_text.chars().take(57).collect();
+                    format!("\"{}...\"", truncated)
+                } else {
+                    format!("\"{}\"", &anchor_text)
+                };
+                container = container.child(
+                    gpui::div()
+                        .pl_2()
+                        .border_l_2()
+                        .border_color(Hsla { h: 0.0, s: 0.0, l: 0.5, a: 0.3 })
+                        .text_color(Hsla { h: 0.0, s: 0.0, l: 0.6, a: 0.8 })
+                        .text_size(block_context.em_width * 0.8)
+                        .mb_1()
+                        .child(SharedString::from(display_anchor)),
+                );
+
+                let display_input = if input_buffer.is_empty() {
+                    "Type your comment... (use CommitMarkdownComment to submit, CancelMarkdownComment to cancel)".to_string()
+                } else {
+                    input_buffer.clone()
+                };
+                container = container.child(
+                    gpui::div()
+                        .p_1()
+                        .bg(Hsla { h: 0.0, s: 0.0, l: 0.1, a: 0.5 })
+                        .rounded_sm()
+                        .text_color(Hsla { h: 0.0, s: 0.0, l: 0.8, a: 1.0 })
+                        .text_size(block_context.em_width * 0.85)
+                        .child(SharedString::from(display_input)),
+                );
+
+                container.into_any_element()
+            });
+
+            block_properties.push(BlockProperties {
+                placement: BlockPlacement::Below(end_anchor),
+                height: Some(5),
+                style: BlockStyle::Flex,
+                render,
+                priority: 100,
+            });
+        }
+    }
+
+    let active_comment_id = editor
+        .markdown_wysiwyg_state
+        .comments
+        .active_comment_id
+        .clone();
+    let comments = editor.markdown_wysiwyg_state.comments.comments.clone();
+
+    for comment in &comments {
+        if comment.resolved {
+            continue;
+        }
+
+        let end_offset = comment.anchor_offset + comment.anchor_length;
+        if end_offset > snapshot.len().0 {
+            continue;
+        }
+
+        let is_active = active_comment_id.as_deref() == Some(&comment.id);
+
+        let comment_clone = comment.clone();
+        let end_anchor = snapshot.anchor_after(MultiBufferOffset(end_offset));
+
+        if is_active {
+            let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
+                render_comment_thread(&comment_clone, block_context)
+            });
+
+            let reply_count = comment.replies.len() as u32;
+            let height = 4 + reply_count.max(1) * 2;
+
+            block_properties.push(BlockProperties {
+                placement: BlockPlacement::Below(end_anchor),
+                height: Some(height),
+                style: BlockStyle::Flex,
+                render,
+                priority: 50,
+            });
+        } else {
+            let comment_id = comment.id.clone();
+            let reply_count = comment.replies.len();
+            let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
+                render_comment_indicator(&comment_id, reply_count, block_context)
+            });
+
+            block_properties.push(BlockProperties {
+                placement: BlockPlacement::Below(end_anchor),
+                height: Some(1),
+                style: BlockStyle::Flex,
+                render,
+                priority: 10,
+            });
+        }
+    }
+
+    if !block_properties.is_empty() {
+        let new_ids = editor.insert_blocks(block_properties, None, cx);
+        editor.markdown_wysiwyg_state.comment_block_ids = new_ids;
+    }
+}
+
+fn render_comment_thread(
+    comment: &MarkdownComment,
+    block_context: &mut BlockContext,
+) -> gpui::AnyElement {
+    let left_margin = block_context.anchor_x;
+    let border_color = Hsla { h: 0.13, s: 0.5, l: 0.5, a: 0.4 };
+    let bg_color = Hsla { h: 0.13, s: 0.15, l: 0.12, a: 0.95 };
+    let text_size = block_context.em_width * 0.85;
+
+    let mut container = gpui::div()
+        .pl(left_margin)
+        .max_w(block_context.max_width * 0.6)
+        .flex()
+        .flex_col()
+        .bg(bg_color)
+        .border_1()
+        .border_color(border_color)
+        .rounded_md()
+        .p_2()
+        .mt_1()
+        .mb_1();
+
+    let created_short = comment.created_at.get(..16).unwrap_or(&comment.created_at);
+    container = container.child(
+        gpui::div()
+            .flex()
+            .flex_row()
+            .justify_between()
+            .mb_1()
+            .child(
+                gpui::div()
+                    .text_color(Hsla { h: 0.6, s: 0.5, l: 0.7, a: 1.0 })
+                    .font_weight(FontWeight::BOLD)
+                    .text_size(text_size)
+                    .child(SharedString::from(comment.author.clone())),
+            )
+            .child(
+                gpui::div()
+                    .text_color(Hsla { h: 0.0, s: 0.0, l: 0.5, a: 0.6 })
+                    .text_size(text_size * 0.85)
+                    .child(SharedString::from(created_short.to_string())),
+            ),
+    );
+
+    let display_anchor = if comment.anchor_text.chars().count() > 80 {
+        let truncated: String = comment.anchor_text.chars().take(77).collect();
+        format!("\"{}...\"", truncated)
+    } else {
+        format!("\"{}\"", &comment.anchor_text)
+    };
+    container = container.child(
+        gpui::div()
+            .pl_2()
+            .border_l_2()
+            .border_color(Hsla { h: 0.0, s: 0.0, l: 0.5, a: 0.3 })
+            .text_color(Hsla { h: 0.0, s: 0.0, l: 0.6, a: 0.8 })
+            .text_size(text_size * 0.9)
+            .mb_2()
+            .child(SharedString::from(display_anchor)),
+    );
+
+    container = container.child(
+        gpui::div()
+            .text_color(Hsla { h: 0.0, s: 0.0, l: 0.85, a: 1.0 })
+            .text_size(text_size)
+            .mb_2()
+            .child(SharedString::from(comment.content.clone())),
+    );
+
+    for reply in &comment.replies {
+        let reply_created = reply.created_at.get(..16).unwrap_or(&reply.created_at);
+        let author_color = if reply.author == "agent" {
+            Hsla { h: 0.33, s: 0.5, l: 0.6, a: 1.0 }
+        } else {
+            Hsla { h: 0.6, s: 0.5, l: 0.7, a: 1.0 }
+        };
+
+        container = container.child(
+            gpui::div()
+                .border_t_1()
+                .border_color(Hsla { h: 0.0, s: 0.0, l: 0.3, a: 0.3 })
+                .pt_1()
+                .mt_1()
+                .flex()
+                .flex_col()
+                .child(
+                    gpui::div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .mb_1()
+                        .child(
+                            gpui::div()
+                                .text_color(author_color)
+                                .font_weight(FontWeight::BOLD)
+                                .text_size(text_size * 0.9)
+                                .child(SharedString::from(reply.author.clone())),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_color(Hsla { h: 0.0, s: 0.0, l: 0.5, a: 0.6 })
+                                .text_size(text_size * 0.8)
+                                .child(SharedString::from(reply_created.to_string())),
+                        ),
+                )
+                .child(
+                    gpui::div()
+                        .text_color(Hsla { h: 0.0, s: 0.0, l: 0.85, a: 1.0 })
+                        .text_size(text_size)
+                        .child(SharedString::from(reply.content.clone())),
+                ),
+        );
+    }
+
+    container = container.child(
+        gpui::div()
+            .border_t_1()
+            .border_color(Hsla { h: 0.0, s: 0.0, l: 0.3, a: 0.2 })
+            .pt_1()
+            .mt_1()
+            .text_color(Hsla { h: 0.0, s: 0.0, l: 0.5, a: 0.5 })
+            .text_size(text_size * 0.75)
+            .child(SharedString::from("ResolveMarkdownComment to close")),
+    );
+
+    container.into_any_element()
+}
+
+fn render_comment_indicator(
+    _comment_id: &str,
+    reply_count: usize,
+    block_context: &mut BlockContext,
+) -> gpui::AnyElement {
+    let left_margin = block_context.anchor_x;
+    let text_size = block_context.em_width * 0.75;
+    let badge_text = if reply_count > 0 {
+        format!("\u{1F4AC} {} {}", reply_count, if reply_count == 1 { "reply" } else { "replies" })
+    } else {
+        "\u{1F4AC} comment (click to expand)".to_string()
+    };
+
+    gpui::div()
+        .pl(left_margin)
+        .flex()
+        .flex_row()
+        .child(
+            gpui::div()
+                .px_2()
+                .py(gpui::px(1.0))
+                .bg(Hsla { h: 0.13, s: 0.3, l: 0.2, a: 0.7 })
+                .rounded_sm()
+                .text_color(Hsla { h: 0.13, s: 0.5, l: 0.7, a: 0.9 })
+                .text_size(text_size)
+                .child(SharedString::from(badge_text)),
+        )
+        .into_any_element()
+}
+
+fn spawn_comment_agent(
+    editor: &mut Editor,
+    comment: &MarkdownComment,
+    cx: &mut Context<Editor>,
+) {
+    let file_path = editor
+        .get_markdown_file_path(cx)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| "<unknown>".to_string());
+
+    let anchor_text = comment.anchor_text.clone();
+    let comment_content = comment.content.clone();
+    let comment_id = comment.id.clone();
+    let comments_file_path = editor
+        .markdown_wysiwyg_state
+        .comments
+        .comments_file_path
+        .clone();
+
+    // Build the agent prompt with full context
+    let agent_prompt = format!(
+        "You are reviewing a markdown document. A user has highlighted text and left a comment.\n\n\
+         **File**: {}\n\n\
+         **Highlighted text**:\n```\n{}\n```\n\n\
+         **User's comment**: {}\n\n\
+         Please respond to the user's comment. Be concise and helpful.",
+        file_path, anchor_text, comment_content
+    );
+
+    log::info!(
+        "Agent spawned for comment {} with {} chars of prompt",
+        comment_id,
+        agent_prompt.len()
+    );
+
+    let placeholder_reply = CommentReply {
+        id: Uuid::new_v4().to_string(),
+        author: "agent".to_string(),
+        content: format!(
+            "[Agent session pending] Prompt sent with {} chars of context from '{}'.",
+            anchor_text.len(),
+            file_path
+        ),
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    if let Some(c) = editor
+        .markdown_wysiwyg_state
+        .comments
+        .comments
+        .iter_mut()
+        .find(|c| c.id == comment_id)
+    {
+        c.replies.push(placeholder_reply);
+    }
+
+    if let Some(path) = &comments_file_path {
+        save_comments_to_file(path, &editor.markdown_wysiwyg_state.comments.comments);
+    }
 }
