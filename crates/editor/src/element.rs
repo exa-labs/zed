@@ -501,6 +501,11 @@ impl EditorElement {
         register_action(editor, window, Editor::toggle_indent_guides);
         register_action(editor, window, Editor::toggle_inlay_hints);
         register_action(editor, window, Editor::toggle_markdown_wysiwyg);
+        register_action(editor, window, Editor::create_markdown_comment);
+        register_action(editor, window, Editor::commit_markdown_comment);
+        register_action(editor, window, Editor::cancel_markdown_comment);
+        register_action(editor, window, Editor::resolve_markdown_comment);
+        register_action(editor, window, Editor::toggle_markdown_comment_thread);
         register_action(editor, window, Editor::toggle_semantic_highlights);
         register_action(editor, window, Editor::toggle_edit_predictions);
         if editor.read(cx).diagnostics_enabled() {

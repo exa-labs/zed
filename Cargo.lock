@@ -5399,6 +5399,7 @@ dependencies = [
  "assets",
  "breadcrumbs",
  "buffer_diff",
+ "chrono",
  "client",
  "clock",
  "collections",

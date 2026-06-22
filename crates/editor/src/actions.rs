@@ -827,6 +827,16 @@ actions!(
         ToggleInlayHints,
         /// Toggles inline WYSIWYG rendering for markdown files.
         ToggleMarkdownWysiwyg,
+        /// Creates a comment on the current selection in WYSIWYG mode.
+        CreateMarkdownComment,
+        /// Resolves the active comment thread.
+        ResolveMarkdownComment,
+        /// Toggles visibility of the comment thread at cursor.
+        ToggleMarkdownCommentThread,
+        /// Commits the pending comment input.
+        CommitMarkdownComment,
+        /// Cancels the pending comment input.
+        CancelMarkdownComment,
         /// Toggles semantic highlights display.
         ToggleSemanticHighlights,
         /// Toggles inline values display.
