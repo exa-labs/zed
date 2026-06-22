@@ -67,7 +67,6 @@ impl MarkdownWysiwygState {
     }
 }
 
-// -- Comment data model ------------------------------------------------
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CommentReply {
@@ -147,7 +146,7 @@ fn save_comments_to_file(path: &std::path::Path, comments: &[MarkdownComment]) {
     };
     if let Ok(json) = serde_json::to_string_pretty(&file) {
         if let Err(error) = std::fs::write(path, json) {
-            eprintln!("[WYSIWYG-COMMENT] Failed to write comments file: {}", error);
+            log::error!("Failed to write comments file: {}", error);
         }
     }
 }
@@ -1841,7 +1840,6 @@ pub fn try_handle_image_paste(
     true
 }
 
-// -- Comment loading / rendering / agent spawning --------------------------
 
 fn load_comments(editor: &mut Editor, cx: &mut Context<Editor>) {
     if let Some(md_path) = editor.get_markdown_file_path(cx) {
@@ -1916,7 +1914,6 @@ fn apply_comment_blocks(
 
     let mut block_properties: Vec<BlockProperties<Anchor>> = Vec::new();
 
-    // Render the pending comment input block
     if let Some(pending) = &editor.markdown_wysiwyg_state.comments.pending_comment_input {
         let end_offset = pending.anchor_offset + pending.anchor_length;
         if end_offset <= snapshot.len().0 {
@@ -1942,7 +1939,6 @@ fn apply_comment_blocks(
                     .mt_1()
                     .mb_1();
 
-                // Header
                 container = container.child(
                     gpui::div()
                         .flex()
@@ -1958,9 +1954,9 @@ fn apply_comment_blocks(
                         ),
                 );
 
-                // Quoted anchor text
-                let display_anchor = if anchor_text.len() > 60 {
-                    format!("\"{}...\"", &anchor_text[..57])
+                let display_anchor = if anchor_text.chars().count() > 60 {
+                    let truncated: String = anchor_text.chars().take(57).collect();
+                    format!("\"{}...\"", truncated)
                 } else {
                     format!("\"{}\"", &anchor_text)
                 };
@@ -1975,8 +1971,6 @@ fn apply_comment_blocks(
                         .child(SharedString::from(display_anchor)),
                 );
 
-                // Input area (rendered as text for now; actual editor integration
-                // would require a nested Entity<Editor> which is a deeper lift)
                 let display_input = if input_buffer.is_empty() {
                     "Type your comment... (use CommitMarkdownComment to submit, CancelMarkdownComment to cancel)".to_string()
                 } else {
@@ -2005,7 +1999,6 @@ fn apply_comment_blocks(
         }
     }
 
-    // Render comment threads for active and visible comments
     let active_comment_id = editor
         .markdown_wysiwyg_state
         .comments
@@ -2025,12 +2018,10 @@ fn apply_comment_blocks(
 
         let is_active = active_comment_id.as_deref() == Some(&comment.id);
 
-        // Render a small indicator for all unresolved comments
         let comment_clone = comment.clone();
         let end_anchor = snapshot.anchor_after(MultiBufferOffset(end_offset));
 
         if is_active {
-            // Full thread view
             let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
                 render_comment_thread(&comment_clone, block_context)
             });
@@ -2046,7 +2037,6 @@ fn apply_comment_blocks(
                 priority: 50,
             });
         } else {
-            // Collapsed indicator
             let comment_id = comment.id.clone();
             let reply_count = comment.replies.len();
             let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
@@ -2091,7 +2081,6 @@ fn render_comment_thread(
         .mt_1()
         .mb_1();
 
-    // Header with author and timestamp
     let created_short = comment.created_at.get(..16).unwrap_or(&comment.created_at);
     container = container.child(
         gpui::div()
@@ -2114,9 +2103,9 @@ fn render_comment_thread(
             ),
     );
 
-    // Quoted anchor text
-    let display_anchor = if comment.anchor_text.len() > 80 {
-        format!("\"{}...\"", &comment.anchor_text[..77])
+    let display_anchor = if comment.anchor_text.chars().count() > 80 {
+        let truncated: String = comment.anchor_text.chars().take(77).collect();
+        format!("\"{}...\"", truncated)
     } else {
         format!("\"{}\"", &comment.anchor_text)
     };
@@ -2131,7 +2120,6 @@ fn render_comment_thread(
             .child(SharedString::from(display_anchor)),
     );
 
-    // User's comment content
     container = container.child(
         gpui::div()
             .text_color(Hsla { h: 0.0, s: 0.0, l: 0.85, a: 1.0 })
@@ -2140,7 +2128,6 @@ fn render_comment_thread(
             .child(SharedString::from(comment.content.clone())),
     );
 
-    // Replies (agent responses)
     for reply in &comment.replies {
         let reply_created = reply.created_at.get(..16).unwrap_or(&reply.created_at);
         let author_color = if reply.author == "agent" {
@@ -2186,7 +2173,6 @@ fn render_comment_thread(
         );
     }
 
-    // Resolve button hint
     container = container.child(
         gpui::div()
             .border_t_1()
@@ -2260,15 +2246,12 @@ fn spawn_comment_agent(
         file_path, anchor_text, comment_content
     );
 
-    eprintln!(
-        "[WYSIWYG-COMMENT] Agent spawned for comment {} — prompt: {}",
+    log::info!(
+        "Agent spawned for comment {} with {} chars of prompt",
         comment_id,
-        &agent_prompt[..agent_prompt.len().min(200)]
+        agent_prompt.len()
     );
 
-    // For now, add a placeholder reply indicating the agent was invoked.
-    // Full agent integration (ThreadStore, streaming) requires deeper wiring
-    // into Zed's agent infrastructure which depends on the agent crate.
     let placeholder_reply = CommentReply {
         id: Uuid::new_v4().to_string(),
         author: "agent".to_string(),
