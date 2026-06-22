@@ -193,6 +193,10 @@ struct HorizontalRuleDecoration {
     range: Range<usize>,
 }
 
+struct BlockIdDecoration {
+    range: Range<usize>,
+}
+
 struct MarkdownDecorations {
     inline_decorations: Vec<InlineDecoration>,
     headings: Vec<HeadingDecoration>,
@@ -207,6 +211,7 @@ struct MarkdownDecorations {
     callouts: Vec<CalloutDecoration>,
     horizontal_rules: Vec<HorizontalRuleDecoration>,
     ordered_list_markers: Vec<Range<usize>>,
+    block_ids: Vec<BlockIdDecoration>,
 }
 
 impl MarkdownDecorations {
@@ -266,6 +271,8 @@ impl MarkdownDecorations {
         for marker in &self.ordered_list_markers {
             (marker.end - marker.start).hash(&mut hasher);
         }
+
+        self.block_ids.len().hash(&mut hasher);
 
         hasher.finish()
     }
@@ -508,6 +515,37 @@ fn parse_line_decorations(text: &str) -> LineDecorations {
     }
 }
 
+fn parse_block_ids(text: &str) -> Vec<BlockIdDecoration> {
+    let mut results = Vec::new();
+    let mut line_start = 0;
+    for line in text.split_inclusive('\n') {
+        let line_content = line.trim_end_matches('\n');
+        let trimmed_end = line_content.trim_end();
+        if let Some(caret_pos) = trimmed_end.rfind('^') {
+            if caret_pos > 0 {
+                let before_caret = &trimmed_end[..caret_pos];
+                if before_caret.ends_with(char::is_whitespace) {
+                    let after_caret = &trimmed_end[caret_pos + 1..];
+                    if !after_caret.is_empty()
+                        && after_caret
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                    {
+                        let whitespace_start = before_caret.trim_end().len();
+                        let block_id_start = line_start + whitespace_start;
+                        let block_id_end = line_start + trimmed_end.len();
+                        results.push(BlockIdDecoration {
+                            range: block_id_start..block_id_end,
+                        });
+                    }
+                }
+            }
+        }
+        line_start += line.len();
+    }
+    results
+}
+
 fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
     let parser = Parser::new_ext(text, parse_options());
 
@@ -517,6 +555,7 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
     let mut images: Vec<ImageDecoration> = parse_wikilink_images(text);
     let wikilinks = parse_wikilinks(text);
     let line_decorations = parse_line_decorations(text);
+    let block_ids = parse_block_ids(text);
     let list_items: Vec<ListItemDecoration> = parse_list_items(text)
         .into_iter()
         .filter(|item| {
@@ -776,6 +815,7 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
         callouts: line_decorations.callouts,
         horizontal_rules,
         ordered_list_markers: line_decorations.ordered_list_markers,
+        block_ids,
     }
 }
 
@@ -1696,6 +1736,17 @@ fn apply_marker_folds(
             let start = MultiBufferOffset(callout.marker_range.start);
             let end = MultiBufferOffset(callout.marker_range.end);
             creases.push(Crease::simple(start..end, placeholder));
+        }
+    }
+
+    for block_id in &decorations.block_ids {
+        if within_restriction(&block_id.range)
+            && !marker_overlaps_block(&block_id.range, &block_ranges)
+            && !range_on_cursor_line(&block_id.range, active_range)
+        {
+            let start = MultiBufferOffset(block_id.range.start);
+            let end = MultiBufferOffset(block_id.range.end);
+            creases.push(Crease::simple(start..end, placeholder.clone()));
         }
     }
 
