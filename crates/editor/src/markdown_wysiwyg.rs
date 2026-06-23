@@ -144,10 +144,31 @@ struct HeadingDecoration {
     level: u8,
 }
 
+#[derive(Clone)]
+enum CellSegment {
+    Text {
+        content: String,
+        bold: bool,
+        italic: bool,
+    },
+    Code(String),
+    LineBreak,
+}
+
+impl CellSegment {
+    fn display_len(&self) -> usize {
+        match self {
+            CellSegment::Text { content, .. } => content.len(),
+            CellSegment::Code(content) => content.len(),
+            CellSegment::LineBreak => 1,
+        }
+    }
+}
+
 struct TableDecoration {
     range: Range<usize>,
-    headers: Vec<String>,
-    rows: Vec<Vec<String>>,
+    headers: Vec<Vec<CellSegment>>,
+    rows: Vec<Vec<Vec<CellSegment>>>,
 }
 
 struct ImageDecoration {
@@ -193,6 +214,10 @@ struct HorizontalRuleDecoration {
     range: Range<usize>,
 }
 
+struct BlockIdDecoration {
+    range: Range<usize>,
+}
+
 struct MarkdownDecorations {
     inline_decorations: Vec<InlineDecoration>,
     headings: Vec<HeadingDecoration>,
@@ -207,6 +232,7 @@ struct MarkdownDecorations {
     callouts: Vec<CalloutDecoration>,
     horizontal_rules: Vec<HorizontalRuleDecoration>,
     ordered_list_markers: Vec<Range<usize>>,
+    block_ids: Vec<BlockIdDecoration>,
 }
 
 impl MarkdownDecorations {
@@ -266,6 +292,8 @@ impl MarkdownDecorations {
         for marker in &self.ordered_list_markers {
             (marker.end - marker.start).hash(&mut hasher);
         }
+
+        self.block_ids.len().hash(&mut hasher);
 
         hasher.finish()
     }
@@ -508,6 +536,37 @@ fn parse_line_decorations(text: &str) -> LineDecorations {
     }
 }
 
+fn parse_block_ids(text: &str) -> Vec<BlockIdDecoration> {
+    let mut results = Vec::new();
+    let mut line_start = 0;
+    for line in text.split_inclusive('\n') {
+        let line_content = line.trim_end_matches('\n');
+        let trimmed_end = line_content.trim_end();
+        if let Some(caret_pos) = trimmed_end.rfind('^') {
+            if caret_pos > 0 {
+                let before_caret = &trimmed_end[..caret_pos];
+                if before_caret.ends_with(char::is_whitespace) {
+                    let after_caret = &trimmed_end[caret_pos + 1..];
+                    if !after_caret.is_empty()
+                        && after_caret
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+                    {
+                        let whitespace_start = before_caret.trim_end().len();
+                        let block_id_start = line_start + whitespace_start;
+                        let block_id_end = line_start + trimmed_end.len();
+                        results.push(BlockIdDecoration {
+                            range: block_id_start..block_id_end,
+                        });
+                    }
+                }
+            }
+        }
+        line_start += line.len();
+    }
+    results
+}
+
 fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
     let parser = Parser::new_ext(text, parse_options());
 
@@ -517,6 +576,7 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
     let mut images: Vec<ImageDecoration> = parse_wikilink_images(text);
     let wikilinks = parse_wikilinks(text);
     let line_decorations = parse_line_decorations(text);
+    let block_ids = parse_block_ids(text);
     let list_items: Vec<ListItemDecoration> = parse_list_items(text)
         .into_iter()
         .filter(|item| {
@@ -535,23 +595,31 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
     let mut heading_start: Option<(u8, usize)> = None;
 
     let mut table_start: Option<usize> = None;
-    let mut table_headers: Vec<String> = Vec::new();
-    let mut table_rows: Vec<Vec<String>> = Vec::new();
-    let mut current_row: Vec<String> = Vec::new();
-    let mut current_cell = String::new();
+    let mut table_headers: Vec<Vec<CellSegment>> = Vec::new();
+    let mut table_rows: Vec<Vec<Vec<CellSegment>>> = Vec::new();
+    let mut current_row: Vec<Vec<CellSegment>> = Vec::new();
+    let mut current_cell: Vec<CellSegment> = Vec::new();
     let mut in_table_head = false;
     let mut in_table_cell = false;
+    let mut cell_bold = false;
+    let mut cell_italic = false;
 
     for (event, range) in parser.into_offset_iter() {
         match event {
             Event::Start(Tag::Strong) => {
-                bold_start = Some(range.start);
-                syntax_markers.push(SyntaxMarker {
-                    range: range.start..range.start + 2,
-                });
+                if in_table_cell {
+                    cell_bold = true;
+                } else {
+                    bold_start = Some(range.start);
+                    syntax_markers.push(SyntaxMarker {
+                        range: range.start..range.start + 2,
+                    });
+                }
             }
             Event::End(TagEnd::Strong) => {
-                if let Some(start) = bold_start.take() {
+                if in_table_cell {
+                    cell_bold = false;
+                } else if let Some(start) = bold_start.take() {
                     syntax_markers.push(SyntaxMarker {
                         range: range.end - 2..range.end,
                     });
@@ -562,13 +630,19 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
                 }
             }
             Event::Start(Tag::Emphasis) => {
-                italic_start = Some(range.start);
-                syntax_markers.push(SyntaxMarker {
-                    range: range.start..range.start + 1,
-                });
+                if in_table_cell {
+                    cell_italic = true;
+                } else {
+                    italic_start = Some(range.start);
+                    syntax_markers.push(SyntaxMarker {
+                        range: range.start..range.start + 1,
+                    });
+                }
             }
             Event::End(TagEnd::Emphasis) => {
-                if let Some(start) = italic_start.take() {
+                if in_table_cell {
+                    cell_italic = false;
+                } else if let Some(start) = italic_start.take() {
                     syntax_markers.push(SyntaxMarker {
                         range: range.end - 1..range.end,
                     });
@@ -596,26 +670,30 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
                 }
             }
             Event::Code(code_text) => {
-                let code_str = code_text.as_ref();
-                let full_start = range.start;
-                let full_end = range.end;
-                if full_end > full_start + code_str.len() {
-                    let backtick_len = (full_end - full_start - code_str.len()) / 2;
-                    syntax_markers.push(SyntaxMarker {
-                        range: full_start..full_start + backtick_len,
-                    });
-                    syntax_markers.push(SyntaxMarker {
-                        range: full_end - backtick_len..full_end,
-                    });
-                    inline_decorations.push(InlineDecoration {
-                        content_range: full_start + backtick_len..full_end - backtick_len,
-                        kind: DecorationKind::InlineCode,
-                    });
+                if in_table_cell {
+                    current_cell.push(CellSegment::Code(code_text.to_string()));
                 } else {
-                    inline_decorations.push(InlineDecoration {
-                        content_range: full_start..full_end,
-                        kind: DecorationKind::InlineCode,
-                    });
+                    let code_str = code_text.as_ref();
+                    let full_start = range.start;
+                    let full_end = range.end;
+                    if full_end > full_start + code_str.len() {
+                        let backtick_len = (full_end - full_start - code_str.len()) / 2;
+                        syntax_markers.push(SyntaxMarker {
+                            range: full_start..full_start + backtick_len,
+                        });
+                        syntax_markers.push(SyntaxMarker {
+                            range: full_end - backtick_len..full_end,
+                        });
+                        inline_decorations.push(InlineDecoration {
+                            content_range: full_start + backtick_len..full_end - backtick_len,
+                            kind: DecorationKind::InlineCode,
+                        });
+                    } else {
+                        inline_decorations.push(InlineDecoration {
+                            content_range: full_start..full_end,
+                            kind: DecorationKind::InlineCode,
+                        });
+                    }
                 }
             }
             Event::Start(Tag::Heading { level, .. }) => {
@@ -739,7 +817,24 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
             }
             Event::Text(text_content) => {
                 if in_table_cell {
-                    current_cell.push_str(text_content.as_ref());
+                    current_cell.push(CellSegment::Text {
+                        content: text_content.to_string(),
+                        bold: cell_bold,
+                        italic: cell_italic,
+                    });
+                }
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if in_table_cell {
+                    current_cell.push(CellSegment::LineBreak);
+                }
+            }
+            Event::Html(html) => {
+                if in_table_cell {
+                    let html_lower = html.to_lowercase();
+                    if html_lower.contains("<br") {
+                        current_cell.push(CellSegment::LineBreak);
+                    }
                 }
             }
             _ => {}
@@ -776,6 +871,7 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
         callouts: line_decorations.callouts,
         horizontal_rules,
         ordered_list_markers: line_decorations.ordered_list_markers,
+        block_ids,
     }
 }
 
@@ -842,6 +938,8 @@ impl Editor {
             self.preferred_line_length_override = None;
             self.set_text_style_refinement(TextStyleRefinement::default());
             self.style = None;
+            self.display_map
+                .update(cx, |display_map, cx| display_map.set_hang_indent(false, cx));
             self.markdown_wysiwyg_state.active = false;
             WYSIWYG_GLOBALLY_ENABLED.store(false, Ordering::SeqCst);
             cx.notify();
@@ -862,6 +960,8 @@ impl Editor {
             self.soft_wrap_mode_override =
                 Some(language::language_settings::SoftWrap::Bounded);
             self.preferred_line_length_override = Some(READABLE_LINE_LENGTH);
+            self.display_map
+                .update(cx, |display_map, cx| display_map.set_hang_indent(true, cx));
             self.markdown_wysiwyg_state.active = true;
             WYSIWYG_GLOBALLY_ENABLED.store(true, Ordering::SeqCst);
             refresh_wysiwyg_decorations(self, cx);
@@ -1507,6 +1607,50 @@ fn marker_overlaps_block(marker: &Range<usize>, block_ranges: &[Range<usize>]) -
     })
 }
 
+fn render_cell_segment(
+    parent: gpui::Div,
+    segment: &CellSegment,
+) -> gpui::Div {
+    match segment {
+        CellSegment::Text {
+            content,
+            bold,
+            italic,
+        } => {
+            let mut text_element = gpui::div();
+            if *bold {
+                text_element = text_element.font_weight(FontWeight::BOLD);
+            }
+            if *italic {
+                text_element = text_element.italic();
+            }
+            let text_element = text_element.child(SharedString::from(content.clone()));
+            parent.child(text_element)
+        }
+        CellSegment::Code(content) => {
+            let code_element = gpui::div()
+                .font_family("monospace")
+                .bg(Hsla {
+                    h: 0.0,
+                    s: 0.0,
+                    l: 0.5,
+                    a: 0.15,
+                })
+                .rounded(gpui::px(3.0))
+                .px(gpui::px(4.0))
+                .child(SharedString::from(content.clone()));
+            parent.child(code_element)
+        }
+        CellSegment::LineBreak => {
+            parent.child(
+                gpui::div()
+                    .w_full()
+                    .h(gpui::px(0.0)),
+            )
+        }
+    }
+}
+
 fn apply_marker_folds(
     editor: &mut Editor,
     _snapshot: &MultiBufferSnapshot,
@@ -1542,9 +1686,8 @@ fn apply_marker_folds(
             gpui::div()
                 .flex()
                 .items_center()
-                .pl(gpui::px(20.0))
                 .text_color(bullet_color)
-                .child(SharedString::from("•  "))
+                .child(SharedString::from("• "))
                 .into_any_element()
         }),
         constrain_width: false,
@@ -1696,6 +1839,17 @@ fn apply_marker_folds(
         }
     }
 
+    for block_id in &decorations.block_ids {
+        if within_restriction(&block_id.range)
+            && !marker_overlaps_block(&block_id.range, &block_ranges)
+            && !range_on_cursor_line(&block_id.range, active_range)
+        {
+            let start = MultiBufferOffset(block_id.range.start);
+            let end = MultiBufferOffset(block_id.range.end);
+            creases.push(Crease::simple(start..end, placeholder.clone()));
+        }
+    }
+
     if !creases.is_empty() {
         editor.display_map.update(cx, |map, cx| map.fold(creases, cx));
         cx.notify();
@@ -1796,10 +1950,11 @@ fn apply_blocks(
         let column_count = headers.len();
         let mut column_widths: Vec<f32> = Vec::with_capacity(column_count);
         for (col_index, header) in headers.iter().enumerate() {
-            let mut max_len = header.len();
+            let mut max_len: usize = header.iter().map(|s| s.display_len()).sum();
             for row in &rows {
                 if let Some(cell) = row.get(col_index) {
-                    max_len = max_len.max(cell.len());
+                    let cell_len: usize = cell.iter().map(|s| s.display_len()).sum();
+                    max_len = max_len.max(cell_len);
                 }
             }
             let text_based_width = (max_len as f32) * 7.0 + padding_px;
@@ -1838,17 +1993,22 @@ fn apply_blocks(
 
             for (col_index, header) in headers.iter().enumerate() {
                 let col_width = column_widths.get(col_index).copied().unwrap_or(100.0);
-                header_row = header_row.child(
-                    gpui::div()
-                        .w(gpui::px(col_width))
-                        .flex_shrink_0()
-                        .px_2()
-                        .py_1()
-                        .font_weight(FontWeight::BOLD)
-                        .border_r_1()
-                        .border_color(border_color)
-                        .child(SharedString::from(header.clone())),
-                );
+                let mut cell_div = gpui::div()
+                    .w(gpui::px(col_width))
+                    .flex_shrink_0()
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .font_weight(FontWeight::BOLD)
+                    .border_r_1()
+                    .border_color(border_color);
+                for segment in header {
+                    cell_div = render_cell_segment(cell_div, segment);
+                }
+                header_row = header_row.child(cell_div);
             }
             inner_table = inner_table.child(header_row);
 
@@ -1862,16 +2022,21 @@ fn apply_blocks(
 
                 for (col_index, cell) in row.iter().enumerate() {
                     let col_width = column_widths.get(col_index).copied().unwrap_or(100.0);
-                    row_element = row_element.child(
-                        gpui::div()
-                            .w(gpui::px(col_width))
-                            .flex_shrink_0()
-                            .px_2()
-                            .py_1()
-                            .border_r_1()
-                            .border_color(border_color)
-                            .child(SharedString::from(cell.clone())),
-                    );
+                    let mut cell_div = gpui::div()
+                        .w(gpui::px(col_width))
+                        .flex_shrink_0()
+                        .px_2()
+                        .py_1()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .items_center()
+                        .border_r_1()
+                        .border_color(border_color);
+                    for segment in cell {
+                        cell_div = render_cell_segment(cell_div, segment);
+                    }
+                    row_element = row_element.child(cell_div);
                 }
                 inner_table = inner_table.child(row_element);
             }
@@ -1935,32 +2100,77 @@ fn apply_blocks(
         let image_width = image.width;
         let image_height = image.height;
 
-        let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
-            let left_margin = block_context.anchor_x;
-            let mut image_element = if let Some(path) = &resolved_path {
-                gpui::img(path.clone())
-            } else {
-                gpui::img(SharedString::from(url.clone()))
-            };
+        let (render, height): (RenderBlock, u32) = if is_video_url(&url) {
+            let element_id: ElementId =
+                SharedString::from(format!("wysiwyg-video-embed-{}", image.range.start)).into();
+            let label = video_label(&url);
+            let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
+                let left_margin = block_context.anchor_x;
+                let colors = block_context.app.theme().colors();
+                let border_color = colors.border;
+                let background = colors.element_background;
+                let icon_color = colors.text_muted;
+                let label_color = colors.text;
+                let target_path = resolved_path.clone();
+                let target_url = url.clone();
 
-            if let Some(width) = image_width {
-                image_element = image_element.w(gpui::px(width as f32));
-            }
-            if let Some(height) = image_height {
-                image_element = image_element.h(gpui::px(height as f32));
-            }
-            if image_width.is_none() && image_height.is_none() {
-                image_element = image_element.max_w(gpui::px(300.0));
-            }
+                gpui::div()
+                    .pl(left_margin)
+                    .py_1()
+                    .child(
+                        gpui::div()
+                            .id(element_id.clone())
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .max_w(gpui::px(360.0))
+                            .rounded_md()
+                            .border_1()
+                            .border_color(border_color)
+                            .bg(background)
+                            .cursor_pointer()
+                            .child(gpui::div().text_color(icon_color).child(SharedString::from("▶")))
+                            .child(gpui::div().text_color(label_color).child(label.clone()))
+                            .on_click(move |_event, _window, cx| {
+                                if let Some(path) = &target_path {
+                                    cx.open_with_system(path);
+                                } else {
+                                    cx.open_url(&target_url);
+                                }
+                            }),
+                    )
+                    .into_any_element()
+            });
+            (render, 3)
+        } else {
+            let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
+                let left_margin = block_context.anchor_x;
+                let mut image_element = if let Some(path) = &resolved_path {
+                    gpui::img(path.clone())
+                } else {
+                    gpui::img(SharedString::from(url.clone()))
+                };
 
-            gpui::div()
-                .pl(left_margin)
-                .py_1()
-                .child(image_element)
-                .into_any_element()
-        });
+                if let Some(width) = image_width {
+                    image_element = image_element.w(gpui::px(width as f32));
+                }
+                if let Some(height) = image_height {
+                    image_element = image_element.h(gpui::px(height as f32));
+                }
+                if image_width.is_none() && image_height.is_none() {
+                    image_element = image_element.max_w(gpui::px(300.0));
+                }
 
-        let height = 10;
+                gpui::div()
+                    .pl(left_margin)
+                    .py_1()
+                    .child(image_element)
+                    .into_any_element()
+            });
+            (render, 10)
+        };
 
         block_ranges.push(image.range.clone());
         block_anchors.push(start..end);
@@ -2517,6 +2727,29 @@ fn is_image_path(path: &Path) -> bool {
                 | "tif"
         )
     )
+}
+
+/// Whether an embed reference points at a video file. GPUI has no general
+/// video-playback element (its `Surface` is a macOS-only CoreVideo buffer used
+/// for screen sharing, not a file player), so video embeds are rendered as a
+/// clickable card rather than an inline `gpui::img`, which would fail to decode.
+fn is_video_url(url: &str) -> bool {
+    let path_part = url.split('?').next().unwrap_or(url);
+    let lowercased = path_part.to_ascii_lowercase();
+    [".mov", ".mp4", ".webm", ".m4v", ".mkv"]
+        .iter()
+        .any(|extension| lowercased.ends_with(extension))
+}
+
+/// The file name shown on a video embed card, falling back to the raw reference
+/// when no file-name component can be extracted (for example a bare URL).
+fn video_label(url: &str) -> SharedString {
+    let path_part = url.split('?').next().unwrap_or(url);
+    let label = Path::new(path_part)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path_part);
+    SharedString::from(label.to_string())
 }
 
 /// Places a dropped image next to the document and returns the file name to use

@@ -37,6 +37,12 @@ pub struct WrapMap {
     wrap_width: Option<Pixels>,
     background_task: Option<Task<()>>,
     font_with_size: (Font, Pixels),
+    /// When set, soft-wrapped continuation rows that begin with a leading
+    /// element (e.g. a WYSIWYG list/checkbox/quote marker fold) are
+    /// hanging-indented so they align under the first row's text rather than
+    /// returning to the far-left margin. Gated to WYSIWYG so normal code
+    /// editing keeps the default leading-whitespace indent behavior.
+    hang_indent: bool,
 }
 
 #[derive(Clone)]
@@ -128,6 +134,7 @@ impl WrapMap {
                 edits_since_sync: Default::default(),
                 snapshot: WrapSnapshot::new(tab_snapshot),
                 background_task: None,
+                hang_indent: false,
             };
             this.set_wrap_width(wrap_width, cx);
             mem::take(&mut this.edits_since_sync);
@@ -191,6 +198,16 @@ impl WrapMap {
         true
     }
 
+    pub fn set_hang_indent(&mut self, hang_indent: bool, cx: &mut Context<Self>) -> bool {
+        if hang_indent == self.hang_indent {
+            return false;
+        }
+
+        self.hang_indent = hang_indent;
+        self.rewrap(cx);
+        true
+    }
+
     #[ztracing::instrument(skip_all)]
     fn rewrap(&mut self, cx: &mut Context<Self>) {
         self.background_task.take();
@@ -210,6 +227,7 @@ impl WrapMap {
                 old: range.clone(),
                 new: range,
             }];
+            let hang_indent = self.hang_indent;
 
             if total_rows < WRAP_YIELD_ROW_INTERVAL {
                 let edits = gpui::block_on(new_snapshot.update(
@@ -217,13 +235,20 @@ impl WrapMap {
                     &tab_edits,
                     wrap_width,
                     &mut line_wrapper,
+                    hang_indent,
                 ));
                 self.snapshot = new_snapshot;
                 self.edits_since_sync = self.edits_since_sync.compose(&edits);
             } else {
                 let task = cx.background_spawn(async move {
                     let edits = new_snapshot
-                        .update(tab_snapshot, &tab_edits, wrap_width, &mut line_wrapper)
+                        .update(
+                            tab_snapshot,
+                            &tab_edits,
+                            wrap_width,
+                            &mut line_wrapper,
+                            hang_indent,
+                        )
                         .await;
                     (new_snapshot, edits)
                 });
@@ -298,6 +323,7 @@ impl WrapMap {
             let text_system = cx.text_system().clone();
             let (font, font_size) = self.font_with_size.clone();
             let mut line_wrapper = text_system.line_wrapper(font, font_size);
+            let hang_indent = self.hang_indent;
 
             if pending_edits.len() == 1
                 && let Some((_, tab_edits)) = pending_edits.back()
@@ -311,6 +337,7 @@ impl WrapMap {
                     &tab_edits,
                     wrap_width,
                     &mut line_wrapper,
+                    hang_indent,
                 ));
                 self.snapshot = snapshot;
                 self.edits_since_sync = self.edits_since_sync.compose(&wrap_edits);
@@ -319,7 +346,13 @@ impl WrapMap {
                     let mut edits = Patch::default();
                     for (tab_snapshot, tab_edits) in pending_edits {
                         let wrap_edits = snapshot
-                            .update(tab_snapshot, &tab_edits, wrap_width, &mut line_wrapper)
+                            .update(
+                                tab_snapshot,
+                                &tab_edits,
+                                wrap_width,
+                                &mut line_wrapper,
+                                hang_indent,
+                            )
                             .await;
                         edits = edits.compose(&wrap_edits);
                     }
@@ -465,6 +498,7 @@ impl WrapSnapshot {
         tab_edits: &[TabEdit],
         wrap_width: Pixels,
         line_wrapper: &mut LineWrapper,
+        hang_indent: bool,
     ) -> WrapPatch {
         #[derive(Debug)]
         struct RowEdit {
@@ -506,6 +540,12 @@ impl WrapSnapshot {
                 &TabPoint::new(row_edits.peek().unwrap().old_rows.start, 0),
                 Bias::Right,
             );
+
+            let space_width = if hang_indent {
+                line_wrapper.width_for_char(' ')
+            } else {
+                gpui::px(0.)
+            };
 
             while let Some(edit) = row_edits.next() {
                 if edit.new_rows.start > new_transforms.summary().input.lines.row {
@@ -556,11 +596,19 @@ impl WrapSnapshot {
                         break;
                     }
 
+                    let extra_indent = if hang_indent {
+                        leading_marker_indent(&line_fragments, space_width)
+                    } else {
+                        0
+                    };
+
                     let mut prev_boundary_ix = 0;
                     for boundary in line_wrapper.wrap_line(&line_fragments, wrap_width) {
                         let wrapped = &line[prev_boundary_ix..boundary.ix];
                         push_isomorphic(&mut edit_transforms, TextSummary::from(wrapped));
-                        edit_transforms.push(Transform::wrap(boundary.next_indent));
+                        let indent =
+                            (boundary.next_indent + extra_indent).min(LineWrapper::MAX_INDENT);
+                        edit_transforms.push(Transform::wrap(indent));
                         prev_boundary_ix = boundary.ix;
                     }
 
@@ -1247,6 +1295,48 @@ fn push_isomorphic(transforms: &mut Vec<Transform>, summary: TextSummary) {
         return;
     }
     transforms.push(Transform::isomorphic(summary));
+}
+
+/// Computes the additional hanging indent (in space columns) for a soft-wrapped
+/// line whose first row begins with one or more leading element fragments, such
+/// as WYSIWYG list/checkbox/quote marker folds. The result is the rendered
+/// width of those leading elements (plus any whitespace separating them from the
+/// first word) expressed in space-width units, so continuation rows align under
+/// the first row's text. Lines that do not start with a leading element get no
+/// extra indent. The leading whitespace *before* the first element is already
+/// accounted for by `LineWrapper::wrap_line`, so it is intentionally excluded.
+fn leading_marker_indent(line_fragments: &[gpui::LineFragment], space_width: Pixels) -> u32 {
+    if space_width <= gpui::px(0.) {
+        return 0;
+    }
+
+    let mut leading_width = gpui::px(0.);
+    let mut seen_element = false;
+    for fragment in line_fragments {
+        match fragment {
+            gpui::LineFragment::Element { width, .. } => {
+                leading_width += *width;
+                seen_element = true;
+            }
+            gpui::LineFragment::Text { text } => {
+                for character in text.chars() {
+                    if character == '\n' {
+                        continue;
+                    }
+                    if character == ' ' {
+                        if seen_element {
+                            leading_width += space_width;
+                        }
+                    } else if seen_element {
+                        return (leading_width / space_width).round() as u32;
+                    } else {
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+    0
 }
 
 trait SumTreeExt {

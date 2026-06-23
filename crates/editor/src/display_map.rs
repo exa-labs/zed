@@ -1256,6 +1256,11 @@ impl DisplayMap {
             .update(cx, |map, cx| map.set_wrap_width(width, cx))
     }
 
+    pub fn set_hang_indent(&self, hang_indent: bool, cx: &mut Context<Self>) -> bool {
+        self.wrap_map
+            .update(cx, |map, cx| map.set_hang_indent(hang_indent, cx))
+    }
+
     #[instrument(skip_all)]
     pub fn update_fold_widths(
         &mut self,
