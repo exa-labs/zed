@@ -10031,6 +10031,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "lean_infoview"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "gpui",
+ "language",
+ "lsp",
+ "project",
+ "serde",
+ "settings",
+ "text",
+ "theme",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "leb128"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22983,6 +23002,7 @@ dependencies = [
  "language_selector",
  "language_tools",
  "languages",
+ "lean_infoview",
  "line_ending_selector",
  "log",
  "markdown",
