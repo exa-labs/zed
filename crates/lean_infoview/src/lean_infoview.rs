@@ -107,18 +107,20 @@ impl LeanInfoView {
     }
 
     fn new(
-        _workspace: &mut Workspace,
+        workspace: &mut Workspace,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> Entity<Self> {
         let workspace_handle = cx.entity();
+        let initial_editor = active_full_editor(workspace, cx);
         cx.new(|cx| {
             let workspace_subscription = cx.subscribe_in(
                 &workspace_handle,
                 window,
                 |this: &mut Self, workspace, event, window, cx| {
                     if let workspace::Event::ActiveItemChanged = event {
-                        this.handle_active_item_changed(workspace, window, cx);
+                        let active_editor = active_full_editor(workspace.read(cx), cx);
+                        this.handle_active_editor_changed(active_editor, window, cx);
                     }
                 },
             );
@@ -133,22 +135,17 @@ impl LeanInfoView {
                 _editor_subscription: None,
                 update_task: Task::ready(()),
             };
-            this.handle_active_item_changed(&workspace_handle, window, cx);
+            this.handle_active_editor_changed(initial_editor, window, cx);
             this
         })
     }
 
-    fn handle_active_item_changed(
+    fn handle_active_editor_changed(
         &mut self,
-        workspace: &Entity<Workspace>,
+        active_editor: Option<Entity<Editor>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let active_editor = workspace.read(cx).active_item(cx).and_then(|item| {
-            item.act_as::<Editor>(cx)
-                .filter(|editor| editor.read(cx).mode().is_full())
-        });
-
         let Some(editor) = active_editor.filter(|editor| editor_has_lean_buffer(editor, cx)) else {
             if self.active_editor.take().is_some() {
                 self._editor_subscription = None;
@@ -244,6 +241,13 @@ impl LeanInfoView {
                     .map(|line| div().child(SharedString::from(line.to_owned()))),
             )
     }
+}
+
+fn active_full_editor(workspace: &Workspace, cx: &App) -> Option<Entity<Editor>> {
+    workspace.active_item(cx).and_then(|item| {
+        item.act_as::<Editor>(cx)
+            .filter(|editor| editor.read(cx).mode().is_full())
+    })
 }
 
 fn editor_has_lean_buffer(editor: &Entity<Editor>, cx: &App) -> bool {
