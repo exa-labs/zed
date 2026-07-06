@@ -18,7 +18,7 @@ use project::Project;
 use serde::{Deserialize, Serialize};
 use settings::Settings;
 use text::ToPointUtf16;
-use theme::ThemeSettings;
+use theme_settings::ThemeSettings;
 use ui::{Divider, IconName, Label, LabelCommon, LabelSize, prelude::*, v_flex};
 use util::ResultExt;
 use workspace::{
@@ -87,7 +87,6 @@ enum InfoViewState {
 
 pub struct LeanInfoView {
     focus_handle: FocusHandle,
-    width: Option<Pixels>,
     position: DockPosition,
     active_editor: Option<Entity<Editor>>,
     state: InfoViewState,
@@ -127,7 +126,6 @@ impl LeanInfoView {
 
             let mut this = Self {
                 focus_handle: cx.focus_handle(),
-                width: None,
                 position: DockPosition::Right,
                 active_editor: None,
                 state: InfoViewState::default(),
@@ -188,9 +186,8 @@ impl LeanInfoView {
         editor: Entity<Editor>,
         cx: &mut gpui::AsyncApp,
     ) -> Result<()> {
-        let Some((server, buffer, position)) = this.update(cx, |_, cx| {
-            lean_server_and_position_for_editor(&editor, cx)
-        })?
+        let Some((server, buffer, position)) =
+            this.update(cx, |_, cx| lean_server_and_position_for_editor(&editor, cx))?
         else {
             return Ok(());
         };
@@ -204,15 +201,15 @@ impl LeanInfoView {
 
         let params = buffer.read_with(cx, |buffer, cx| {
             text_document_position_params(buffer, position, cx)
-        })??;
+        })?;
 
         let plain_goal = server
-            .request::<LeanPlainGoalRequest>(params.clone())
+            .request::<LeanPlainGoalRequest>(params.clone(), lsp::DEFAULT_LSP_REQUEST_TIMEOUT)
             .await
             .into_response()
             .context("lean plain goal request")?;
         let plain_term_goal = server
-            .request::<LeanPlainTermGoalRequest>(params)
+            .request::<LeanPlainTermGoalRequest>(params, lsp::DEFAULT_LSP_REQUEST_TIMEOUT)
             .await
             .into_response()
             .context("lean plain term goal request")?;
@@ -272,7 +269,10 @@ fn lean_server_and_position_for_editor(
     let editor = editor.read(cx);
     let project = editor.project()?.clone();
     let cursor = editor.selections.newest_anchor().head();
-    let (buffer, position) = editor.buffer().read(cx).text_anchor_for_position(cursor, cx)?;
+    let (buffer, position) = editor
+        .buffer()
+        .read(cx)
+        .text_anchor_for_position(cursor, cx)?;
     let language = buffer.read(cx).language()?;
     if !is_lean_language(language.name().as_ref()) {
         return None;
@@ -290,7 +290,7 @@ fn find_lean_server(
     lsp_store.update(cx, |lsp_store, cx| {
         buffer.update(cx, |buffer, cx| {
             lsp_store
-                .language_servers_for_local_buffer(buffer, cx)
+                .running_language_servers_for_local_buffer(buffer, cx)
                 .map(|(_, server)| server.clone())
                 .find(|server| server.name().0.to_lowercase().contains("lean"))
         })
@@ -341,9 +341,8 @@ impl Render for LeanInfoView {
                             .size(LabelSize::Small),
                     );
                 } else {
-                    content = content.children(
-                        goals.iter().map(|goal| self.render_goal_block(goal, cx)),
-                    );
+                    content =
+                        content.children(goals.iter().map(|goal| self.render_goal_block(goal, cx)));
                 }
                 if let Some(term_goal) = term_goal {
                     content = content
@@ -400,13 +399,8 @@ impl Panel for LeanInfoView {
         cx.notify();
     }
 
-    fn size(&self, _window: &Window, _cx: &App) -> Pixels {
-        self.width.unwrap_or(DEFAULT_WIDTH)
-    }
-
-    fn set_size(&mut self, size: Option<Pixels>, _: &mut Window, cx: &mut Context<Self>) {
-        self.width = size;
-        cx.notify();
+    fn default_size(&self, _window: &Window, _cx: &App) -> Pixels {
+        DEFAULT_WIDTH
     }
 
     fn icon(&self, _window: &Window, _cx: &App) -> Option<IconName> {
