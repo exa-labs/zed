@@ -609,6 +609,8 @@ fn initialize_panels(
             workspace_handle.clone(),
             cx.clone(),
         );
+        let lean_infoview =
+            lean_infoview::LeanInfoView::load(workspace_handle.clone(), cx.clone());
         let debug_panel = DebugPanel::load(workspace_handle.clone(), cx);
 
         let (
@@ -618,6 +620,7 @@ fn initialize_panels(
             git_panel,
             channels_panel,
             notification_panel,
+            lean_infoview,
             debug_panel,
         ) = futures::try_join!(
             project_panel,
@@ -626,6 +629,7 @@ fn initialize_panels(
             terminal_panel,
             channels_panel,
             notification_panel,
+            lean_infoview,
             debug_panel,
         )?;
 
@@ -636,6 +640,7 @@ fn initialize_panels(
             workspace.add_panel(git_panel, window, cx);
             workspace.add_panel(channels_panel, window, cx);
             workspace.add_panel(notification_panel, window, cx);
+            workspace.add_panel(lean_infoview, window, cx);
             workspace.add_panel(debug_panel, window, cx);
         })?;
 
