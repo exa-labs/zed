@@ -35,6 +35,8 @@ pub mod items;
 mod jsx_tag_auto_close;
 mod linked_editing_ranges;
 mod lsp_ext;
+mod markdown_math;
+mod markdown_wysiwyg;
 mod mouse_context_menu;
 pub mod movement;
 mod persistence;
@@ -44,7 +46,6 @@ pub mod scroll;
 mod selections_collection;
 pub mod semantic_tokens;
 mod split;
-mod markdown_wysiwyg;
 pub mod split_editor_view;
 
 mod bookmarks;

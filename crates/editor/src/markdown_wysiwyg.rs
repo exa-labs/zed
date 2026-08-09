@@ -2,7 +2,9 @@ use crate::display_map::{
     BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CustomBlockId,
     FoldPlaceholder, HighlightKey, RenderBlock,
 };
+use crate::markdown_math::{MathStyle, estimate_math_lines, parse_math, render_math};
 use crate::{Editor, ToggleMarkdownWysiwyg};
+use collections::HashSet;
 use gpui::{
     App, AppContext as _, Context, ElementId, Entity, FontStyle, FontWeight, HighlightStyle, Hsla,
     InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
@@ -10,15 +12,16 @@ use gpui::{
 };
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-use theme::ActiveTheme;
-use util::ResultExt as _;
-use collections::HashSet;
+use settings::Settings;
 use std::any::TypeId;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use theme::ActiveTheme;
+use theme_settings::ThemeSettings;
+use util::ResultExt as _;
 
 /// Global flag that tracks whether WYSIWYG mode should be auto-enabled for
 /// markdown files. When the user toggles WYSIWYG on, this is set to true;
@@ -38,7 +41,7 @@ const READABLE_LINE_LENGTH: u32 = 60;
 /// be a serif that ships with the host OS by default rather than a single
 /// hardcoded name (a Linux-only face like "Liberation Serif" renders as
 /// monospace on macOS, which is what made the document look like code).
-fn wysiwyg_serif_family() -> SharedString {
+pub(crate) fn wysiwyg_serif_family() -> SharedString {
     if cfg!(target_os = "macos") {
         SharedString::new_static("Palatino")
     } else if cfg!(target_os = "windows") {
@@ -50,7 +53,7 @@ fn wysiwyg_serif_family() -> SharedString {
 
 /// Cross-platform serif chain used for glyph coverage when the primary family
 /// lacks a specific glyph. Unknown families are ignored by the resolver.
-fn wysiwyg_serif_fallbacks() -> gpui::FontFallbacks {
+pub(crate) fn wysiwyg_serif_fallbacks() -> gpui::FontFallbacks {
     gpui::FontFallbacks::from_fonts(vec![
         "Palatino".to_owned(),
         "Hoefler Text".to_owned(),
@@ -151,6 +154,11 @@ enum CellSegment {
         bold: bool,
         italic: bool,
     },
+    Math {
+        source: String,
+        bold: bool,
+        italic: bool,
+    },
     Code(String),
     LineBreak,
 }
@@ -160,6 +168,7 @@ impl CellSegment {
         match self {
             CellSegment::Text { content, .. } => content.len(),
             CellSegment::Code(content) => content.len(),
+            CellSegment::Math { source, .. } => source.len(),
             CellSegment::LineBreak => 1,
         }
     }
@@ -214,6 +223,13 @@ struct HorizontalRuleDecoration {
     range: Range<usize>,
 }
 
+#[derive(Clone)]
+struct MathDecoration {
+    range: Range<usize>,
+    source: String,
+    display: bool,
+}
+
 struct BlockIdDecoration {
     range: Range<usize>,
 }
@@ -231,6 +247,7 @@ struct MarkdownDecorations {
     blockquotes: Vec<BlockquoteDecoration>,
     callouts: Vec<CalloutDecoration>,
     horizontal_rules: Vec<HorizontalRuleDecoration>,
+    math: Vec<MathDecoration>,
     ordered_list_markers: Vec<Range<usize>>,
     block_ids: Vec<BlockIdDecoration>,
 }
@@ -288,6 +305,13 @@ impl MarkdownDecorations {
 
         self.horizontal_rules.len().hash(&mut hasher);
 
+        self.math.len().hash(&mut hasher);
+        for math in &self.math {
+            math.display.hash(&mut hasher);
+            (math.range.end - math.range.start).hash(&mut hasher);
+            math.source.len().hash(&mut hasher);
+        }
+
         self.ordered_list_markers.len().hash(&mut hasher);
         for marker in &self.ordered_list_markers {
             (marker.end - marker.start).hash(&mut hasher);
@@ -305,6 +329,190 @@ fn parse_options() -> Options {
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_TASKLISTS);
     options
+}
+
+fn parse_math_spans(text: &str) -> Vec<MathDecoration> {
+    let excluded = math_excluded_bytes(text);
+    let mut spans = Vec::new();
+    let mut position = 0;
+    while position < text.len() {
+        if excluded.get(position).copied().unwrap_or(true) {
+            position += 1;
+            continue;
+        }
+        if text.as_bytes().get(position) == Some(&b'\\')
+            && text.as_bytes().get(position + 1) == Some(&b'[')
+        {
+            if let Some(end) = find_math_closer(text, position + 2, "\\]", &excluded, true) {
+                spans.push(MathDecoration {
+                    range: position..end + 2,
+                    source: text[position + 2..end].to_owned(),
+                    display: true,
+                });
+                position = end + 2;
+                continue;
+            }
+        } else if text.as_bytes().get(position) == Some(&b'$')
+            && text.as_bytes().get(position + 1) == Some(&b'$')
+            && !is_escaped(text, position)
+        {
+            if let Some(end) = find_math_closer(text, position + 2, "$$", &excluded, true) {
+                spans.push(MathDecoration {
+                    range: position..end + 2,
+                    source: text[position + 2..end].to_owned(),
+                    display: true,
+                });
+                position = end + 2;
+                continue;
+            }
+        } else if text.as_bytes().get(position) == Some(&b'\\')
+            && text.as_bytes().get(position + 1) == Some(&b'(')
+        {
+            if let Some(end) = find_math_closer(text, position + 2, "\\)", &excluded, false) {
+                spans.push(MathDecoration {
+                    range: position..end + 2,
+                    source: text[position + 2..end].to_owned(),
+                    display: false,
+                });
+                position = end + 2;
+                continue;
+            }
+        } else if text.as_bytes().get(position) == Some(&b'$')
+            && !is_escaped(text, position)
+            && text.as_bytes().get(position + 1) != Some(&b'$')
+        {
+            if let Some(end) = find_math_closer(text, position + 1, "$", &excluded, false) {
+                if end > position + 1
+                    && text.as_bytes().get(end + 1) != Some(&b'$')
+                    && !text[position + 1..end].contains('\n')
+                {
+                    spans.push(MathDecoration {
+                        range: position..end + 1,
+                        source: text[position + 1..end].to_owned(),
+                        display: false,
+                    });
+                    position = end + 1;
+                    continue;
+                }
+            }
+        }
+        position += 1;
+    }
+    spans
+}
+
+fn push_table_text_segments(
+    segments: &mut Vec<CellSegment>,
+    content: &str,
+    bold: bool,
+    italic: bool,
+) {
+    let spans = parse_math_spans(content);
+    let mut position = 0;
+    for span in spans {
+        if span.display || span.range.start < position {
+            continue;
+        }
+        if span.range.start > position {
+            segments.push(CellSegment::Text {
+                content: content[position..span.range.start].to_owned(),
+                bold,
+                italic,
+            });
+        }
+        segments.push(CellSegment::Math {
+            source: span.source,
+            bold,
+            italic,
+        });
+        position = span.range.end;
+    }
+    if position < content.len() {
+        segments.push(CellSegment::Text {
+            content: content[position..].to_owned(),
+            bold,
+            italic,
+        });
+    }
+}
+
+fn find_math_closer(
+    text: &str,
+    start: usize,
+    closer: &str,
+    excluded: &[bool],
+    allow_newlines: bool,
+) -> Option<usize> {
+    let mut search = start;
+    while search + closer.len() <= text.len() {
+        if !allow_newlines && text.as_bytes().get(search) == Some(&b'\n') {
+            return None;
+        }
+        if text.get(search..search + closer.len()) == Some(closer)
+            && !is_escaped(text, search)
+            && (search..search + closer.len())
+                .all(|index| !excluded.get(index).copied().unwrap_or(true))
+        {
+            return Some(search);
+        }
+        search += 1;
+    }
+    None
+}
+
+fn math_excluded_bytes(text: &str) -> Vec<bool> {
+    let mut excluded = vec![false; text.len()];
+    let mut in_fence = false;
+    let mut line_start = 0;
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end_matches('\n').trim_end_matches('\r');
+        let trimmed = content.trim_start();
+        let indented = content.starts_with("    ") || content.starts_with('\t');
+        let fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        if fence || in_fence || indented {
+            for index in line_start..line_start + line.len() {
+                if let Some(value) = excluded.get_mut(index) {
+                    *value = true;
+                }
+            }
+        } else {
+            let mut search = 0;
+            while let Some(relative) = content[search..].find('`') {
+                let start = search + relative;
+                let tick_count = content[start..]
+                    .chars()
+                    .take_while(|character| *character == '`')
+                    .count();
+                let close_start = start + tick_count;
+                let Some(close_relative) = content[close_start..].find(&"`".repeat(tick_count))
+                else {
+                    break;
+                };
+                let end = close_start + close_relative + tick_count;
+                for index in line_start + start..line_start + end {
+                    if let Some(value) = excluded.get_mut(index) {
+                        *value = true;
+                    }
+                }
+                search = end;
+            }
+        }
+        if fence {
+            in_fence = !in_fence;
+        }
+        line_start += line.len();
+    }
+    excluded
+}
+
+fn is_escaped(text: &str, position: usize) -> bool {
+    let mut slash_count = 0;
+    let mut cursor = position;
+    while cursor > 0 && text.as_bytes().get(cursor - 1) == Some(&b'\\') {
+        slash_count += 1;
+        cursor -= 1;
+    }
+    slash_count % 2 == 1
 }
 
 fn parse_image_dimensions(title: &str) -> (Option<u32>, Option<u32>) {
@@ -359,7 +567,8 @@ fn parse_wikilinks(text: &str) -> Vec<WikilinkDecoration> {
     let mut search_start = 0;
     while let Some(start) = text[search_start..].find("[[") {
         let absolute_start = search_start + start;
-        if absolute_start > 0 && text.as_bytes().get(absolute_start.wrapping_sub(1)) == Some(&b'!') {
+        if absolute_start > 0 && text.as_bytes().get(absolute_start.wrapping_sub(1)) == Some(&b'!')
+        {
             search_start = absolute_start + 2;
             continue;
         }
@@ -400,9 +609,7 @@ fn parse_list_items(text: &str) -> Vec<ListItemDecoration> {
         }
     }
     if text.starts_with("- ") || text.starts_with("* ") {
-        results.push(ListItemDecoration {
-            marker_range: 0..2,
-        });
+        results.push(ListItemDecoration { marker_range: 0..2 });
     } else {
         let trimmed = text.trim_start();
         let indent = text.len() - trimmed.len();
@@ -497,11 +704,17 @@ fn parse_line_decorations(text: &str) -> LineDecorations {
                     marker_range: content_start..content_start + marker_len,
                 });
             }
-        } else if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* "))
+        } else if let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
         {
             let checked = if rest.starts_with("[ ] ") || rest == "[ ]" {
                 Some(false)
-            } else if rest.starts_with("[x] ") || rest.starts_with("[X] ") || rest == "[x]" || rest == "[X]" {
+            } else if rest.starts_with("[x] ")
+                || rest.starts_with("[X] ")
+                || rest == "[x]"
+                || rest == "[X]"
+            {
                 Some(true)
             } else {
                 None
@@ -519,8 +732,7 @@ fn parse_line_decorations(text: &str) -> LineDecorations {
                 if (after_digits.starts_with(". ") || after_digits.starts_with(") "))
                     && trimmed.len() > digit_count + 2
                 {
-                    ordered_list_markers
-                        .push(content_start..content_start + digit_count + 1);
+                    ordered_list_markers.push(content_start..content_start + digit_count + 1);
                 }
             }
         }
@@ -571,6 +783,7 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
     let parser = Parser::new_ext(text, parse_options());
 
     let (mut inline_decorations, mut syntax_markers) = parse_highlights(text);
+    let math = parse_math_spans(text);
     let mut headings = Vec::new();
     let mut tables = Vec::new();
     let mut images: Vec<ImageDecoration> = parse_wikilink_images(text);
@@ -760,7 +973,9 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
                     });
                 }
             }
-            Event::Start(Tag::Image { dest_url, title, .. }) => {
+            Event::Start(Tag::Image {
+                dest_url, title, ..
+            }) => {
                 let url = dest_url.to_string();
                 let mut end = range.end;
                 if let Some(pos) = text[range.start..].find(')') {
@@ -817,11 +1032,12 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
             }
             Event::Text(text_content) => {
                 if in_table_cell {
-                    current_cell.push(CellSegment::Text {
-                        content: text_content.to_string(),
-                        bold: cell_bold,
-                        italic: cell_italic,
-                    });
+                    push_table_text_segments(
+                        &mut current_cell,
+                        &text_content,
+                        cell_bold,
+                        cell_italic,
+                    );
                 }
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -870,6 +1086,7 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
         blockquotes: line_decorations.blockquotes,
         callouts: line_decorations.callouts,
         horizontal_rules,
+        math,
         ordered_list_markers: line_decorations.ordered_list_markers,
         block_ids,
     }
@@ -907,7 +1124,9 @@ fn range_contains_cursor(range: &Range<usize>, cursor: usize) -> bool {
 fn cursor_line_range(text: &str, cursor: usize) -> Range<usize> {
     let cursor = cursor.min(text.len());
     let line_start = text[..cursor].rfind('\n').map_or(0, |pos| pos + 1);
-    let line_end = text[cursor..].find('\n').map_or(text.len(), |pos| cursor + pos);
+    let line_end = text[cursor..]
+        .find('\n')
+        .map_or(text.len(), |pos| cursor + pos);
     line_start..line_end
 }
 
@@ -931,7 +1150,10 @@ impl Editor {
             {
                 self.show_line_numbers = show_line_numbers;
             }
-            if let Some(soft_wrap) = self.markdown_wysiwyg_state.previous_soft_wrap_override.take()
+            if let Some(soft_wrap) = self
+                .markdown_wysiwyg_state
+                .previous_soft_wrap_override
+                .take()
             {
                 self.soft_wrap_mode_override = soft_wrap;
             }
@@ -957,8 +1179,7 @@ impl Editor {
             self.style = None;
 
             self.set_show_gutter(false, cx);
-            self.soft_wrap_mode_override =
-                Some(language::language_settings::SoftWrap::Bounded);
+            self.soft_wrap_mode_override = Some(language::language_settings::SoftWrap::Bounded);
             self.preferred_line_length_override = Some(READABLE_LINE_LENGTH);
             self.display_map
                 .update(cx, |display_map, cx| display_map.set_hang_indent(true, cx));
@@ -1018,9 +1239,9 @@ pub fn schedule_wysiwyg_refresh(editor: &mut Editor, cx: &mut Context<Editor>) {
         // Snapshot the text on the foreground (a cheap rope copy), then run the
         // markdown parse on a background thread. Parsing the whole buffer on the
         // UI thread on every edit was a large part of the per-keystroke cost.
-        let Ok(text) =
-            editor.read_with(cx, |editor, cx| editor.buffer().read(cx).snapshot(cx).text())
-        else {
+        let Ok(text) = editor.read_with(cx, |editor, cx| {
+            editor.buffer().read(cx).snapshot(cx).text()
+        }) else {
             return;
         };
 
@@ -1088,7 +1309,14 @@ fn apply_wysiwyg_decorations(
     // Use the full selection range (covers all lines in a multi-line selection)
     let active_line_range = selection_line_range(editor, text, cx);
 
-    apply_highlights(editor, snapshot, decorations, cursor, &active_line_range, cx);
+    apply_highlights(
+        editor,
+        snapshot,
+        decorations,
+        cursor,
+        &active_line_range,
+        cx,
+    );
     remove_stale_folds(editor, cx);
     apply_marker_folds(
         editor,
@@ -1114,15 +1342,24 @@ fn refresh_active_line_decorations(editor: &mut Editor, cx: &mut Context<Editor>
     let cursor = cursor_offset(editor, cx);
     let active_line_range = selection_line_range(editor, &text, cx);
 
-    let previous_active_line_range =
-        editor.markdown_wysiwyg_state.previous_active_line_range.clone();
+    let previous_active_line_range = editor
+        .markdown_wysiwyg_state
+        .previous_active_line_range
+        .clone();
     if previous_active_line_range.as_ref() == Some(&active_line_range) {
         return;
     }
 
     let decorations = parse_markdown_decorations(&text);
 
-    apply_highlights(editor, &snapshot, &decorations, cursor, &active_line_range, cx);
+    apply_highlights(
+        editor,
+        &snapshot,
+        &decorations,
+        cursor,
+        &active_line_range,
+        cx,
+    );
 
     // Re-fold the markers on the line the cursor just left so it renders again.
     if let Some(previous) = previous_active_line_range.as_ref() {
@@ -1355,8 +1592,15 @@ fn apply_highlights(
 
     // Collect diagnostics for the full buffer to detect unresolved links
     let all_diagnostics: Vec<(Range<usize>, String)> = snapshot
-        .diagnostics_in_range::<MultiBufferOffset>(MultiBufferOffset(0)..MultiBufferOffset(snapshot.len().0))
-        .map(|entry| (entry.range.start.0..entry.range.end.0, entry.diagnostic.message.clone()))
+        .diagnostics_in_range::<MultiBufferOffset>(
+            MultiBufferOffset(0)..MultiBufferOffset(snapshot.len().0),
+        )
+        .map(|entry| {
+            (
+                entry.range.start.0..entry.range.end.0,
+                entry.diagnostic.message.clone(),
+            )
+        })
         .collect();
 
     let mut wikilink_ranges = Vec::new();
@@ -1511,6 +1755,11 @@ fn collect_block_replaced_ranges(
             block_ranges.push(rule.range.clone());
         }
     }
+    for math in &decorations.math {
+        if math.display && !range_on_cursor_line(&math.range, active_range) {
+            block_ranges.push(math.range.clone());
+        }
+    }
     block_ranges.sort_by_key(|range| range.start);
     block_ranges
 }
@@ -1602,14 +1851,16 @@ fn callout_appearance(kind: &str) -> (&'static str, Hsla) {
 }
 
 fn marker_overlaps_block(marker: &Range<usize>, block_ranges: &[Range<usize>]) -> bool {
-    block_ranges.iter().any(|block| {
-        marker.start < block.end && marker.end > block.start
-    })
+    block_ranges
+        .iter()
+        .any(|block| marker.start < block.end && marker.end > block.start)
 }
 
 fn render_cell_segment(
     parent: gpui::Div,
     segment: &CellSegment,
+    base_font_size: f32,
+    text_color: Hsla,
 ) -> gpui::Div {
     match segment {
         CellSegment::Text {
@@ -1641,13 +1892,26 @@ fn render_cell_segment(
                 .child(SharedString::from(content.clone()));
             parent.child(code_element)
         }
-        CellSegment::LineBreak => {
-            parent.child(
-                gpui::div()
-                    .w_full()
-                    .h(gpui::px(0.0)),
-            )
+        CellSegment::Math {
+            source,
+            bold,
+            italic,
+        } => {
+            let style = MathStyle {
+                base_font_size,
+                text_color,
+                font_family: wysiwyg_serif_family(),
+            };
+            let mut math = gpui::div().child(render_math(&parse_math(source), &style, false));
+            if *bold {
+                math = math.font_weight(FontWeight::BOLD);
+            }
+            if *italic {
+                math = math.italic();
+            }
+            parent.child(math)
         }
+        CellSegment::LineBreak => parent.child(gpui::div().w_full().h(gpui::px(0.0))),
     }
 }
 
@@ -1697,6 +1961,38 @@ fn apply_marker_folds(
     };
 
     let mut creases = Vec::new();
+    let base_font_size: f32 = ThemeSettings::get_global(cx).buffer_font_size(cx).into();
+    for math in &decorations.math {
+        if math.display
+            || !within_restriction(&math.range)
+            || range_on_cursor_line(&math.range, active_range)
+            || marker_overlaps_block(&math.range, &block_ranges)
+        {
+            continue;
+        }
+        let node = parse_math(&math.source);
+        let style = MathStyle {
+            base_font_size,
+            text_color: cx.theme().colors().editor_foreground,
+            font_family: wysiwyg_serif_family(),
+        };
+        let placeholder = FoldPlaceholder {
+            render: Arc::new({
+                let node = node.clone();
+                let style = style.clone();
+                move |_fold_id, _range, _cx| render_math(&node, &style, false)
+            }),
+            constrain_width: false,
+            merge_adjacent: false,
+            type_tag: Some(TypeId::of::<WysiwygFoldTag>()),
+            collapsed_text: Some("".into()),
+        };
+        creases.push(Crease::simple(
+            MultiBufferOffset(math.range.start)..MultiBufferOffset(math.range.end),
+            placeholder,
+        ));
+    }
+
     for marker in &decorations.syntax_markers {
         if marker.range.start < marker.range.end
             && within_restriction(&marker.range)
@@ -1778,12 +2074,7 @@ fn apply_marker_folds(
                 .items_center()
                 .h_full()
                 .pr(gpui::px(14.0))
-                .child(
-                    gpui::div()
-                        .w(gpui::px(3.0))
-                        .h_full()
-                        .bg(quote_bar_color),
-                )
+                .child(gpui::div().w(gpui::px(3.0)).h_full().bg(quote_bar_color))
                 .into_any_element()
         }),
         constrain_width: false,
@@ -1851,7 +2142,9 @@ fn apply_marker_folds(
     }
 
     if !creases.is_empty() {
-        editor.display_map.update(cx, |map, cx| map.fold(creases, cx));
+        editor
+            .display_map
+            .update(cx, |map, cx| map.fold(creases, cx));
         cx.notify();
     }
 }
@@ -1881,6 +2174,41 @@ fn apply_blocks(
     let mut block_properties: Vec<BlockProperties<Anchor>> = Vec::new();
     let mut block_ranges: Vec<Range<usize>> = Vec::new();
     let mut block_anchors: Vec<Range<Anchor>> = Vec::new();
+
+    for (math_index, math) in decorations.math.iter().enumerate() {
+        if !math.display || range_on_cursor_line(&math.range, active_range) {
+            continue;
+        }
+        let start = snapshot.anchor_before(MultiBufferOffset(math.range.start));
+        let end = snapshot.anchor_after(MultiBufferOffset(math.range.end));
+        let node = parse_math(&math.source);
+        let source_line_count = math.source.lines().count().max(1) as u32;
+        let estimated_height = estimate_math_lines(&node).max(source_line_count);
+        let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
+            let style = MathStyle {
+                base_font_size: (block_context.em_width * 1.2).into(),
+                text_color: block_context.app.theme().colors().editor_foreground,
+                font_family: wysiwyg_serif_family(),
+            };
+            gpui::div()
+                .id(ElementId::Name(SharedString::from(format!(
+                    "wysiwyg-math-{math_index}"
+                ))))
+                .pl(block_context.anchor_x)
+                .py_1()
+                .child(render_math(&node, &style, true))
+                .into_any_element()
+        });
+        block_ranges.push(math.range.clone());
+        block_anchors.push(start..end);
+        block_properties.push(BlockProperties {
+            placement: BlockPlacement::Replace(start..=end),
+            height: Some(estimated_height),
+            style: BlockStyle::Flex,
+            render,
+            priority: 0,
+        });
+    }
 
     for heading in &decorations.headings {
         if range_on_cursor_line(&heading.line_range, active_range) {
@@ -2006,7 +2334,12 @@ fn apply_blocks(
                     .border_r_1()
                     .border_color(border_color);
                 for segment in header {
-                    cell_div = render_cell_segment(cell_div, segment);
+                    cell_div = render_cell_segment(
+                        cell_div,
+                        segment,
+                        (block_context.em_width * 1.2).into(),
+                        block_context.app.theme().colors().editor_foreground,
+                    );
                 }
                 header_row = header_row.child(cell_div);
             }
@@ -2034,7 +2367,12 @@ fn apply_blocks(
                         .border_r_1()
                         .border_color(border_color);
                     for segment in cell {
-                        cell_div = render_cell_segment(cell_div, segment);
+                        cell_div = render_cell_segment(
+                            cell_div,
+                            segment,
+                            (block_context.em_width * 1.2).into(),
+                            block_context.app.theme().colors().editor_foreground,
+                        );
                     }
                     row_element = row_element.child(cell_div);
                 }
@@ -2043,9 +2381,10 @@ fn apply_blocks(
 
             let table_total_width: f32 = column_widths.iter().sum();
             let scrollable_wrapper = gpui::div()
-                .id(ElementId::Name(
-                    SharedString::from(format!("wysiwyg-table-{}", table_index)),
-                ))
+                .id(ElementId::Name(SharedString::from(format!(
+                    "wysiwyg-table-{}",
+                    table_index
+                ))))
                 .overflow_x_scroll()
                 .max_w(block_context.max_width * 0.7)
                 .child(inner_table.w(gpui::px(table_total_width)));
@@ -2131,7 +2470,11 @@ fn apply_blocks(
                             .border_color(border_color)
                             .bg(background)
                             .cursor_pointer()
-                            .child(gpui::div().text_color(icon_color).child(SharedString::from("▶")))
+                            .child(
+                                gpui::div()
+                                    .text_color(icon_color)
+                                    .child(SharedString::from("▶")),
+                            )
                             .child(gpui::div().text_color(label_color).child(label.clone()))
                             .on_click(move |_event, _window, cx| {
                                 if let Some(path) = &target_path {
@@ -2236,8 +2579,8 @@ fn apply_blocks(
     let mut new_matched: Vec<bool> = vec![false; block_ranges.len()];
 
     for (id, old_anchor_range) in old_blocks {
-        let resolved =
-            old_anchor_range.start.to_offset(snapshot).0..old_anchor_range.end.to_offset(snapshot).0;
+        let resolved = old_anchor_range.start.to_offset(snapshot).0
+            ..old_anchor_range.end.to_offset(snapshot).0;
         let mut matched = false;
         for (i, new_range) in block_ranges.iter().enumerate() {
             if !new_matched[i] && resolved == *new_range {
@@ -2293,7 +2636,10 @@ fn apply_references_block(
     // The block's anchor follows the document end across edits, so it only needs
     // rebuilding when the reference list itself changes. Skipping when unchanged
     // avoids removing and re-inserting the block on every cursor move.
-    let already_rendered = !editor.markdown_wysiwyg_state.references_block_ids.is_empty()
+    let already_rendered = !editor
+        .markdown_wysiwyg_state
+        .references_block_ids
+        .is_empty()
         && editor.markdown_wysiwyg_state.rendered_references == references;
     if already_rendered {
         return;
@@ -2331,20 +2677,10 @@ fn apply_references_block(
             a: 0.2,
         };
 
-        let mut container = gpui::div()
-            .pl(left_margin)
-            .pt_4()
-            .flex()
-            .flex_col()
-            .gap_1();
+        let mut container = gpui::div().pl(left_margin).pt_4().flex().flex_col().gap_1();
 
         // Divider line
-        container = container.child(
-            gpui::div()
-                .h(gpui::px(1.0))
-                .bg(border_color)
-                .mb_2(),
-        );
+        container = container.child(gpui::div().h(gpui::px(1.0)).bg(border_color).mb_2());
 
         // Header
         container = container.child(
@@ -2364,11 +2700,7 @@ fn apply_references_block(
         // Reference entries
         for ref_name in &references {
             container = container.child(
-                gpui::div()
-                    .flex()
-                    .flex_row()
-                    .gap_1()
-                    .child(
+                gpui::div().flex().flex_row().gap_1().child(
                         gpui::div()
                             .text_color(Hsla {
                                 h: 0.6,
@@ -2442,7 +2774,8 @@ pub fn fetch_references(editor: &mut Editor, cx: &mut Context<Editor>) {
                     continue;
                 }
                 // Skip the current file
-                let entry_stem = path.file_stem()
+                let entry_stem = path
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_string();
@@ -2469,12 +2802,14 @@ pub fn fetch_references(editor: &mut Editor, cx: &mut Context<Editor>) {
 
         backlink_files.sort();
 
-        editor.update(cx, |editor, cx| {
+        editor
+            .update(cx, |editor, cx| {
             editor.markdown_wysiwyg_state.cached_references = backlink_files;
             if editor.markdown_wysiwyg_state.active {
                 refresh_wysiwyg_decorations(editor, cx);
             }
-        }).ok();
+            })
+            .ok();
     });
 }
 
@@ -2494,9 +2829,7 @@ fn clear_wysiwyg_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     let type_id = TypeId::of::<WysiwygFoldTag>();
     let snapshot = editor.buffer().read(cx).snapshot(cx);
     let buffer_len = snapshot.len();
-    let full_range = vec![
-        MultiBufferOffset(0)..buffer_len,
-    ];
+    let full_range = vec![MultiBufferOffset(0)..buffer_len];
     editor.remove_folds_with_type(&full_range, type_id, false, cx);
 
     let old_block_ids: HashSet<CustomBlockId> = editor
@@ -2535,8 +2868,12 @@ pub fn on_selection_changed(editor: &mut Editor, window: &mut Window, cx: &mut C
     // rows are revealed, so this avoids re-parsing the document on every
     // keystroke (the dominant source of typing lag).
     let anchor = editor.selections.newest_anchor();
-    let head_row = snapshot.offset_to_point(anchor.head().to_offset(&snapshot)).row;
-    let tail_row = snapshot.offset_to_point(anchor.tail().to_offset(&snapshot)).row;
+    let head_row = snapshot
+        .offset_to_point(anchor.head().to_offset(&snapshot))
+        .row;
+    let tail_row = snapshot
+        .offset_to_point(anchor.tail().to_offset(&snapshot))
+        .row;
     let active_rows = head_row.min(tail_row)..head_row.max(tail_row);
     if editor.markdown_wysiwyg_state.previous_active_rows.as_ref() == Some(&active_rows) {
         return;
@@ -2551,14 +2888,19 @@ pub fn on_selection_changed(editor: &mut Editor, window: &mut Window, cx: &mut C
         let mut adjustment: Option<usize> = None;
         for heading in &decorations.headings {
             if cursor == heading.line_range.start {
-                let was_block = editor.markdown_wysiwyg_state.block_ids
+                let was_block =
+                    editor
+                        .markdown_wysiwyg_state
+                        .block_ids
                     .iter()
                     .any(|(_, anchor_range)| {
                         anchor_range.start.to_offset(&snapshot).0 == heading.line_range.start
                     });
                 if was_block {
                     let prefix_len = heading.level as usize;
-                    let space_after = if text.as_bytes().get(heading.line_range.start + prefix_len) == Some(&b' ') {
+                    let space_after = if text.as_bytes().get(heading.line_range.start + prefix_len)
+                        == Some(&b' ')
+                    {
                         1
                     } else {
                         0
@@ -2715,7 +3057,8 @@ fn is_image_path(path: &Path) -> bool {
     matches!(
         extension.as_deref(),
         Some(
-            "png" | "jpg"
+            "png"
+                | "jpg"
                 | "jpeg"
                 | "gif"
                 | "webp"
@@ -2861,4 +3204,54 @@ pub fn try_handle_image_drop(
     });
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn math_spans_skip_code_and_escaped_currency() {
+        let text = "```md\n$code$\n```\n`$inline$` and \\$5 and $x$";
+        let spans = parse_math_spans(text);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].source, "x");
+    }
+
+    #[test]
+    fn math_spans_reject_unmatched_delimiters() {
+        let text = "unmatched $x and another $$display";
+        assert!(parse_math_spans(text).is_empty());
+    }
+
+    #[test]
+    fn math_spans_find_multiple_inline_values() {
+        let spans = parse_math_spans("first $a$ then \\(b+c\\) and $d$");
+        assert_eq!(spans.len(), 3);
+        assert!(!spans[0].display);
+        assert!(!spans[1].display);
+        assert_eq!(spans[2].source, "d");
+    }
+
+    #[test]
+    fn math_spans_support_multiline_display_values() {
+        let spans = parse_math_spans("$$a\n+b$$");
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].display);
+        assert_eq!(spans[0].source, "a\n+b");
+    }
+
+    #[test]
+    fn math_spans_work_inside_headings_lists_and_links() {
+        let text = "# Heading $x$\n- item $y$\n[link $z$](https://example.com)\n[[wiki $w$]]";
+        let spans = parse_math_spans(text);
+        assert_eq!(spans.len(), 4);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x", "y", "z", "w"]
+        );
+    }
 }
