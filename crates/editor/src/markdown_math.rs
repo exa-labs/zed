@@ -1,5 +1,6 @@
 use gpui::{
-    AnyElement, FontFallbacks, FontWeight, Hsla, IntoElement, ParentElement, SharedString, Styled,
+    AnyElement, FontWeight, Hsla, IntoElement, ParentElement, SharedString, Styled,
+    prelude::FluentBuilder,
 };
 
 use std::fmt;
@@ -32,7 +33,28 @@ pub enum MathNode {
         environment: String,
         rows: Vec<Vec<MathNode>>,
     },
+    Delimited {
+        left: String,
+        content: Box<MathNode>,
+        right: String,
+        scale: DelimiterScale,
+    },
+    SizedDelimiter {
+        value: String,
+        scale: DelimiterScale,
+    },
     Spacing(f32),
+    LineBreak,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DelimiterScale {
+    Normal,
+    Big,
+    Bigg,
+    Biggg,
+    Bigggg,
+    Content,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +76,6 @@ pub struct MathStyle {
     pub base_font_size: f32,
     pub text_color: Hsla,
     pub font_family: SharedString,
-    pub font_fallbacks: FontFallbacks,
 }
 
 impl fmt::Debug for MathStyle {
@@ -182,6 +203,32 @@ impl Parser {
 
     fn parse_command(&mut self, depth: usize) -> MathNode {
         self.position += 1;
+        if let Some(character) = self.chars.get(self.position).copied() {
+            if !character.is_ascii_alphabetic() {
+                self.position += 1;
+                return match character {
+                    ',' => MathNode::Spacing(0.17),
+                    ':' => MathNode::Spacing(0.22),
+                    ';' => MathNode::Spacing(0.28),
+                    '!' => MathNode::Spacing(-0.18),
+                    ' ' => MathNode::Spacing(0.25),
+                    '\\' => MathNode::LineBreak,
+                    '{' => MathNode::SizedDelimiter {
+                        value: "{".to_owned(),
+                        scale: DelimiterScale::Normal,
+                    },
+                    '}' => MathNode::SizedDelimiter {
+                        value: "}".to_owned(),
+                        scale: DelimiterScale::Normal,
+                    },
+                    '|' => MathNode::SizedDelimiter {
+                        value: "|".to_owned(),
+                        scale: DelimiterScale::Normal,
+                    },
+                    _ => MathNode::Text(character.to_string()),
+                };
+            }
+        }
         let start = self.position;
         while self
             .chars
@@ -214,10 +261,27 @@ impl Parser {
                 }
             }
             "begin" => self.parse_environment(depth + 1),
-            "left" | "right" | "big" | "Big" | "bigg" | "Bigg" | "bigl" | "bigr" | "Bigl"
-            | "Bigr" | "biggl" | "biggr" | "Biggl" | "Biggr" => {
-                MathNode::Symbol(delimiter(self.chars.get(self.position).copied()))
-            }
+            "left" => self.parse_delimited(depth, DelimiterScale::Content),
+            "right" => MathNode::SizedDelimiter {
+                value: self.read_delimiter(),
+                scale: DelimiterScale::Content,
+            },
+            "big" | "bigl" | "bigr" => MathNode::SizedDelimiter {
+                value: self.read_delimiter(),
+                scale: DelimiterScale::Big,
+            },
+            "Big" | "Bigl" | "Bigr" => MathNode::SizedDelimiter {
+                value: self.read_delimiter(),
+                scale: DelimiterScale::Bigg,
+            },
+            "bigg" | "biggl" | "biggr" => MathNode::SizedDelimiter {
+                value: self.read_delimiter(),
+                scale: DelimiterScale::Biggg,
+            },
+            "Bigg" | "Biggl" | "Biggr" => MathNode::SizedDelimiter {
+                value: self.read_delimiter(),
+                scale: DelimiterScale::Bigggg,
+            },
             "mathbb" => self.style_argument(MathStyleKind::Blackboard, depth),
             "mathcal" => self.style_argument(MathStyleKind::Calligraphic, depth),
             "mathfrak" => self.style_argument(MathStyleKind::Fraktur, depth),
@@ -226,7 +290,7 @@ impl Parser {
             "mathit" => self.style_argument(MathStyleKind::Italic, depth),
             "mathsf" => self.style_argument(MathStyleKind::Sans, depth),
             "mathtt" => self.style_argument(MathStyleKind::Monospace, depth),
-            "text" | "textbf" => self.style_argument(
+            "text" | "textbf" => self.text_style_argument(
                 if name == "text" {
                     MathStyleKind::Text
                 } else {
@@ -234,15 +298,16 @@ impl Parser {
                 },
                 depth,
             ),
-            "operator" => self.style_argument(MathStyleKind::Operator, depth),
-            "," => MathNode::Spacing(0.17),
-            ":" => MathNode::Spacing(0.22),
-            ";" => MathNode::Spacing(0.28),
-            "!" => MathNode::Spacing(-0.18),
+            "operator" | "operatorname" => self.text_style_argument(MathStyleKind::Operator, depth),
             "quad" => MathNode::Spacing(1.0),
             "qquad" => MathNode::Spacing(2.0),
-            " " => MathNode::Spacing(0.25),
-            "\\" => MathNode::Text(" ".to_owned()),
+            "sin" | "cos" | "tan" | "cot" | "sec" | "csc" | "arcsin" | "arccos" | "arctan"
+            | "sinh" | "cosh" | "tanh" | "log" | "ln" | "exp" | "lim" | "limsup" | "liminf"
+            | "sup" | "inf" | "max" | "min" | "gcd" | "det" | "dim" | "ker" | "arg" | "Pr"
+            | "deg" => MathNode::Styled {
+                style: MathStyleKind::Operator,
+                content: Box::new(MathNode::Text(name)),
+            },
             _ => symbol_or_literal(&name),
         }
     }
@@ -254,18 +319,179 @@ impl Parser {
         }
     }
 
+    fn text_style_argument(&mut self, style: MathStyleKind, depth: usize) -> MathNode {
+        MathNode::Styled {
+            style,
+            content: self.parse_text_argument(depth + 1),
+        }
+    }
+
+    fn parse_text_argument(&mut self, depth: usize) -> Box<MathNode> {
+        if depth >= MAX_PARSE_DEPTH || self.chars.get(self.position) != Some(&'{') {
+            return Box::new(MathNode::Text(String::new()));
+        }
+        self.position += 1;
+        let start = self.position;
+        let mut nesting = 1;
+        while let Some(character) = self.chars.get(self.position).copied() {
+            self.position += 1;
+            match character {
+                '{' => nesting += 1,
+                '}' => {
+                    nesting -= 1;
+                    if nesting == 0 {
+                        let value: String = self.chars[start..self.position - 1].iter().collect();
+                        return Box::new(MathNode::Text(value));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Box::new(MathNode::Text(
+            self.chars[start..self.position].iter().collect(),
+        ))
+    }
+
+    fn parse_delimited(&mut self, depth: usize, scale: DelimiterScale) -> MathNode {
+        let left = self.read_delimiter();
+        let mut nodes = Vec::new();
+        while self.position < self.chars.len() {
+            if self.is_command("right") {
+                self.consume_command_name();
+                let right = self.read_delimiter();
+                return MathNode::Delimited {
+                    left,
+                    content: Box::new(MathNode::Row(nodes)),
+                    right,
+                    scale,
+                };
+            }
+            if self.chars.get(self.position) == Some(&'}') {
+                break;
+            }
+            if self
+                .chars
+                .get(self.position)
+                .is_some_and(|character| character.is_whitespace())
+            {
+                self.position += 1;
+                continue;
+            }
+            let mut node = self.parse_atom(depth + 1);
+            let mut subscript = None;
+            let mut superscript = None;
+            while let Some(script) = self.chars.get(self.position).copied() {
+                if script != '^' && script != '_' {
+                    break;
+                }
+                self.position += 1;
+                let argument = self.parse_argument(depth + 1);
+                if script == '_' {
+                    subscript = Some(argument);
+                } else {
+                    superscript = Some(argument);
+                }
+            }
+            if subscript.is_some() || superscript.is_some() {
+                node = MathNode::Script {
+                    base: Box::new(node),
+                    subscript,
+                    superscript,
+                };
+            }
+            nodes.push(node);
+        }
+        MathNode::Delimited {
+            left,
+            content: Box::new(MathNode::Row(nodes)),
+            right: String::new(),
+            scale,
+        }
+    }
+
+    fn is_command(&self, name: &str) -> bool {
+        let Some(command) = self
+            .chars
+            .get(self.position..self.position + name.len() + 1)
+        else {
+            return false;
+        };
+        command.first() == Some(&'\\')
+            && command[1..]
+                .iter()
+                .take(name.len())
+                .copied()
+                .eq(name.chars())
+            && command
+                .get(name.len() + 1)
+                .is_some_and(|character| !character.is_ascii_alphabetic())
+    }
+
+    fn consume_command_name(&mut self) {
+        if self.chars.get(self.position) == Some(&'\\') {
+            self.position += 1;
+            while self
+                .chars
+                .get(self.position)
+                .is_some_and(|character| character.is_ascii_alphabetic())
+            {
+                self.position += 1;
+            }
+        }
+    }
+
+    fn read_delimiter(&mut self) -> String {
+        if self.chars.get(self.position) == Some(&'\\') {
+            self.position += 1;
+            if let Some(character) = self.chars.get(self.position).copied()
+                && !character.is_ascii_alphabetic()
+            {
+                self.position += 1;
+                return delimiter(Some(character));
+            }
+            let start = self.position;
+            while self
+                .chars
+                .get(self.position)
+                .is_some_and(|character| character.is_ascii_alphabetic())
+            {
+                self.position += 1;
+            }
+            let name: String = self.chars[start..self.position].iter().collect();
+            return match name.as_str() {
+                "langle" => "⟨".to_owned(),
+                "rangle" => "⟩".to_owned(),
+                "lfloor" => "⌊".to_owned(),
+                "rfloor" => "⌋".to_owned(),
+                "lceil" => "⌈".to_owned(),
+                "rceil" => "⌉".to_owned(),
+                "vert" | "lvert" | "rvert" => "|".to_owned(),
+                _ => format!("\\{name}"),
+            };
+        }
+        let character = self.chars.get(self.position).copied();
+        if character.is_some() {
+            self.position += 1;
+        }
+        delimiter(character)
+    }
+
     fn parse_environment(&mut self, _depth: usize) -> MathNode {
         let environment = self.read_braced_text();
         if environment.is_empty() {
             return MathNode::Text("\\begin".to_owned());
         }
-        let remaining: String = self.chars[self.position..].iter().collect();
         let end_marker = format!("\\end{{{environment}}}");
-        let Some(end) = remaining.find(&end_marker) else {
+        let marker: Vec<char> = end_marker.chars().collect();
+        let Some(relative_end) = self.chars[self.position..]
+            .windows(marker.len())
+            .position(|window| window == marker.as_slice())
+        else {
             return MathNode::Text(format!("\\begin{{{environment}}}"));
         };
-        let body = remaining[..end].to_owned();
-        self.position += end + end_marker.chars().count();
+        let end = self.position + relative_end;
+        let body: String = self.chars[self.position..end].iter().collect();
+        self.position = end + marker.len();
         let rows = split_matrix_rows(&body)
             .into_iter()
             .map(|row| {
@@ -415,7 +641,7 @@ fn symbol(name: &str) -> Option<String> {
         "vdots" => "⋮",
         "ddots" => "⋱",
         "angle" => "∠",
-        "deg" => "°",
+        "degree" => "°",
         "prime" => "′",
         "langle" => "⟨",
         "rangle" => "⟩",
@@ -436,11 +662,105 @@ fn delimiter(character: Option<char>) -> String {
 }
 
 pub fn render_math(node: &MathNode, style: &MathStyle, display: bool) -> AnyElement {
-    let _ = &style.font_fallbacks;
-    render_node(node, style, display, style.base_font_size).into_any_element()
+    render_node(
+        node,
+        style,
+        display,
+        style.base_font_size,
+        MathStyleKind::Italic,
+    )
+    .into_any_element()
 }
 
-fn render_node(node: &MathNode, style: &MathStyle, display: bool, font_size: f32) -> gpui::Div {
+pub fn estimate_math_height(node: &MathNode, base_font_size: f32) -> f32 {
+    fn height(node: &MathNode, base_font_size: f32) -> f32 {
+        match node {
+            MathNode::Row(nodes) => nodes
+                .iter()
+                .map(|node| height(node, base_font_size))
+                .fold(base_font_size, f32::max),
+            MathNode::Fraction {
+                numerator,
+                denominator,
+            } => {
+                height(numerator, base_font_size * 0.8)
+                    + height(denominator, base_font_size * 0.8)
+                    + base_font_size * 0.35
+            }
+            MathNode::Radical { index, radicand } => {
+                height(radicand, base_font_size * 0.9)
+                    + if index.is_some() {
+                        base_font_size * 0.3
+                    } else {
+                        0.0
+                    }
+            }
+            MathNode::Script {
+                base,
+                subscript,
+                superscript,
+            } => {
+                height(base, base_font_size)
+                    + superscript
+                        .as_deref()
+                        .map_or(0.0, |node| height(node, base_font_size * 0.6))
+                    + subscript
+                        .as_deref()
+                        .map_or(0.0, |node| height(node, base_font_size * 0.6))
+            }
+            MathNode::Styled { content, .. } => height(content, base_font_size),
+            MathNode::Matrix { rows, .. } => rows.len().max(1) as f32 * base_font_size * 1.25,
+            MathNode::Delimited { content, .. } => height(content, base_font_size),
+            MathNode::SizedDelimiter { .. }
+            | MathNode::Spacing(_)
+            | MathNode::LineBreak
+            | MathNode::Text(_)
+            | MathNode::Symbol(_) => base_font_size,
+        }
+    }
+    height(node, base_font_size)
+}
+
+pub fn estimate_math_lines(node: &MathNode) -> u32 {
+    fn lines(node: &MathNode) -> u32 {
+        match node {
+            MathNode::Row(nodes) => nodes.iter().map(lines).max().unwrap_or(1),
+            MathNode::Fraction {
+                numerator,
+                denominator,
+            } => lines(numerator) + lines(denominator) + 1,
+            MathNode::Radical { radicand, index } => lines(radicand) + u32::from(index.is_some()),
+            MathNode::Script {
+                base,
+                subscript,
+                superscript,
+            } => {
+                let base_lines = lines(base);
+                let script_lines =
+                    subscript.as_deref().map_or(0, lines) + superscript.as_deref().map_or(0, lines);
+                base_lines.max(script_lines + 1)
+            }
+            MathNode::Styled { content, .. } | MathNode::Delimited { content, .. } => {
+                lines(content)
+            }
+            MathNode::Matrix { rows, .. } => rows.len().max(1) as u32,
+            MathNode::SizedDelimiter { .. }
+            | MathNode::Spacing(_)
+            | MathNode::LineBreak
+            | MathNode::Text(_)
+            | MathNode::Symbol(_) => 1,
+        }
+    }
+    lines(node)
+}
+
+fn render_node(
+    node: &MathNode,
+    style: &MathStyle,
+    display: bool,
+    font_size: f32,
+    node_style: MathStyleKind,
+) -> gpui::Div {
     match node {
         MathNode::Row(nodes) => {
             let mut row = gpui::div()
@@ -450,23 +770,27 @@ fn render_node(node: &MathNode, style: &MathStyle, display: bool, font_size: f32
                 .font_family(style.font_family.clone())
                 .text_size(gpui::px(font_size))
                 .text_color(style.text_color);
-            for child in nodes {
-                row = row.child(render_node(child, style, display, font_size));
+            for (index, child) in nodes.iter().enumerate() {
+                if index > 0 {
+                    row = row.child(render_spacing(
+                        node_spacing(nodes[index - 1].clone(), child),
+                        style,
+                        font_size,
+                    ));
+                }
+                row = row.child(render_node(child, style, display, font_size, node_style));
             }
             row
         }
         MathNode::Text(text) | MathNode::Symbol(text) => {
-            let italic = text.chars().count() == 1
+            let italic = node_style == MathStyleKind::Italic
+                && text.chars().count() == 1
                 && text.chars().next().is_some_and(|c| c.is_ascii_alphabetic());
             let mut element = gpui::div()
                 .font_family(style.font_family.clone())
                 .text_size(gpui::px(font_size))
                 .text_color(style.text_color)
-                .child(SharedString::from(styled_symbol(
-                    text,
-                    MathStyleKind::Italic,
-                    italic,
-                )));
+                .child(SharedString::from(styled_symbol(text, node_style, italic)));
             if italic {
                 element = element.italic();
             }
@@ -480,20 +804,41 @@ fn render_node(node: &MathNode, style: &MathStyle, display: bool, font_size: f32
             .flex_col()
             .items_center()
             .font_family(style.font_family.clone())
-            .child(render_node(numerator, style, display, font_size * 0.8))
+            .child(render_node(
+                numerator,
+                style,
+                display,
+                font_size * 0.8,
+                node_style,
+            ))
             .child(
                 gpui::div()
                     .h(gpui::px(1.0))
-                    .w(gpui::px(font_size * 1.2))
+                    .w(gpui::px(
+                        estimate_math_width(numerator, font_size * 0.8)
+                            .max(estimate_math_width(denominator, font_size * 0.8)),
+                    ))
                     .bg(style.text_color),
             )
-            .child(render_node(denominator, style, display, font_size * 0.8)),
+            .child(render_node(
+                denominator,
+                style,
+                display,
+                font_size * 0.8,
+                node_style,
+            )),
         MathNode::Radical { index, radicand } => {
             let radicand_element = gpui::div().flex().flex_col().child(
                 gpui::div()
                     .border_t_1()
                     .border_color(style.text_color)
-                    .child(render_node(radicand, style, display, font_size * 0.9)),
+                    .child(render_node(
+                        radicand,
+                        style,
+                        display,
+                        font_size * 0.9,
+                        node_style,
+                    )),
             );
             let mut root = gpui::div()
                 .flex()
@@ -501,7 +846,11 @@ fn render_node(node: &MathNode, style: &MathStyle, display: bool, font_size: f32
                 .font_family(style.font_family.clone())
                 .text_color(style.text_color);
             if let Some(index) = index {
-                root = root.child(render_node(index, style, display, font_size * 0.45));
+                root = root.child(
+                    render_node(index, style, display, font_size * 0.45, node_style)
+                        .relative()
+                        .top(gpui::px(-font_size * 0.45)),
+                );
             }
             root.child(
                 gpui::div()
@@ -515,30 +864,80 @@ fn render_node(node: &MathNode, style: &MathStyle, display: bool, font_size: f32
             subscript,
             superscript,
         } => {
-            let mut scripts = gpui::div().flex().flex_col().justify_center();
-            if let Some(superscript) = superscript {
-                scripts = scripts.child(render_node(superscript, style, display, font_size * 0.6));
+            let base_size = if display && is_big_operator(base) {
+                font_size * 1.6
+            } else {
+                font_size
+            };
+            if display && is_big_operator(base) {
+                let mut limits = gpui::div().flex().flex_col().items_center();
+                if let Some(superscript) = superscript {
+                    limits = limits.child(render_node(
+                        superscript,
+                        style,
+                        display,
+                        font_size * 0.6,
+                        node_style,
+                    ));
+                }
+                limits = limits.child(render_node(base, style, display, base_size, node_style));
+                if let Some(subscript) = subscript {
+                    limits = limits.child(render_node(
+                        subscript,
+                        style,
+                        display,
+                        font_size * 0.6,
+                        node_style,
+                    ));
+                }
+                limits
+            } else {
+                let mut result = gpui::div()
+                    .flex()
+                    .items_center()
+                    .child(render_node(base, style, display, base_size, node_style));
+                if let Some(superscript) = superscript {
+                    result = result.child(
+                        render_node(superscript, style, display, font_size * 0.6, node_style)
+                            .relative()
+                            .top(gpui::px(-font_size * 0.35)),
+                    );
+                }
+                if let Some(subscript) = subscript {
+                    result = result.child(
+                        render_node(subscript, style, display, font_size * 0.6, node_style)
+                            .relative()
+                            .top(gpui::px(font_size * 0.35)),
+                    );
+                }
+                result
             }
-            if let Some(subscript) = subscript {
-                scripts = scripts.child(render_node(subscript, style, display, font_size * 0.6));
-            }
-            gpui::div()
-                .flex()
-                .items_center()
-                .child(render_node(base, style, display, font_size))
-                .child(scripts)
         }
         MathNode::Styled {
             style: node_style,
             content,
         } => render_styled(content, *node_style, style, display, font_size),
         MathNode::Matrix { environment, rows } => {
-            let mut grid = gpui::div().flex().flex_col().items_center().gap_1();
+            let aligned_left = matches!(
+                environment.as_str(),
+                "cases" | "aligned" | "align" | "array"
+            );
+            let mut grid = gpui::div()
+                .flex()
+                .flex_col()
+                .when(aligned_left, |element| element.items_start())
+                .when(!aligned_left, |element| element.items_center())
+                .gap_1();
             for row in rows {
                 let mut row_element = gpui::div().flex().flex_row().items_center().gap_2();
                 for cell in row {
-                    row_element =
-                        row_element.child(render_node(cell, style, display, font_size * 0.85));
+                    row_element = row_element.child(render_node(
+                        cell,
+                        style,
+                        display,
+                        font_size * 0.85,
+                        node_style,
+                    ));
                 }
                 grid = grid.child(row_element);
             }
@@ -561,6 +960,25 @@ fn render_node(node: &MathNode, style: &MathStyle, display: bool, font_size: f32
             result
         }
         MathNode::Spacing(multiplier) => gpui::div().w(gpui::px(font_size * multiplier)),
+        MathNode::Delimited {
+            left,
+            content,
+            right,
+            scale,
+        } => {
+            let content_height = estimate_math_height(content, font_size);
+            let delimiter_size = delimiter_scale(*scale, font_size, content_height);
+            gpui::div()
+                .flex()
+                .items_center()
+                .child(delimiter_element(left, style, delimiter_size))
+                .child(render_node(content, style, display, font_size, node_style))
+                .child(delimiter_element(right, style, delimiter_size))
+        }
+        MathNode::SizedDelimiter { value, scale } => {
+            delimiter_element(value, style, delimiter_scale(*scale, font_size, font_size))
+        }
+        MathNode::LineBreak => gpui::div().h(gpui::px(font_size * 1.2)),
     }
 }
 
@@ -571,7 +989,13 @@ fn render_styled(
     display: bool,
     font_size: f32,
 ) -> gpui::Div {
-    let mut element = render_node(content, style, display, font_size);
+    let mut element = render_node(content, style, display, font_size, node_style);
+    let family = match node_style {
+        MathStyleKind::Sans => SharedString::new_static("sans-serif"),
+        MathStyleKind::Monospace => SharedString::new_static("monospace"),
+        _ => style.font_family.clone(),
+    };
+    element = element.font_family(family);
     match node_style {
         MathStyleKind::Bold => element = element.font_weight(FontWeight::BOLD),
         MathStyleKind::Italic => element = element.italic(),
@@ -587,6 +1011,126 @@ fn render_styled(
     element
 }
 
+fn delimiter_scale(scale: DelimiterScale, font_size: f32, content_height: f32) -> f32 {
+    match scale {
+        DelimiterScale::Normal => font_size,
+        DelimiterScale::Big => font_size * 1.2,
+        DelimiterScale::Bigg => font_size * 1.5,
+        DelimiterScale::Biggg => font_size * 1.8,
+        DelimiterScale::Bigggg => font_size * 2.1,
+        DelimiterScale::Content => content_height.max(font_size * 1.2),
+    }
+}
+
+fn is_big_operator(node: &MathNode) -> bool {
+    match node {
+        MathNode::Symbol(value) => matches!(value.as_str(), "∑" | "∏" | "∫" | "∮" | "⋃" | "⋂"),
+        MathNode::Styled { content, style } => {
+            if *style != MathStyleKind::Operator {
+                return false;
+            }
+            match content.as_ref() {
+                MathNode::Text(value) => matches!(value.as_str(), "lim" | "limsup" | "liminf"),
+                _ => is_big_operator(content),
+            }
+        }
+        _ => false,
+    }
+}
+
+fn estimate_math_width(node: &MathNode, font_size: f32) -> f32 {
+    match node {
+        MathNode::Row(nodes) => nodes
+            .iter()
+            .map(|node| estimate_math_width(node, font_size))
+            .sum::<f32>()
+            .max(font_size * 0.5),
+        MathNode::Text(text) | MathNode::Symbol(text) => {
+            text.chars().count() as f32 * font_size * 0.6
+        }
+        MathNode::Fraction {
+            numerator,
+            denominator,
+        } => {
+            estimate_math_width(numerator, font_size * 0.8)
+                .max(estimate_math_width(denominator, font_size * 0.8))
+                + font_size * 0.3
+        }
+        MathNode::Radical { radicand, .. } => {
+            estimate_math_width(radicand, font_size * 0.9) + font_size * 0.8
+        }
+        MathNode::Script {
+            base,
+            superscript,
+            subscript,
+        } => {
+            estimate_math_width(base, font_size)
+                + superscript
+                    .as_deref()
+                    .map_or(0.0, |node| estimate_math_width(node, font_size * 0.6))
+                    .max(
+                        subscript
+                            .as_deref()
+                            .map_or(0.0, |node| estimate_math_width(node, font_size * 0.6)),
+                    )
+        }
+        MathNode::Styled { content, .. } | MathNode::Delimited { content, .. } => {
+            estimate_math_width(content, font_size)
+        }
+        MathNode::Matrix { rows, .. } => {
+            let mut width = font_size;
+            for row in rows {
+                let row_width = row
+                    .iter()
+                    .map(|cell| estimate_math_width(cell, font_size * 0.85))
+                    .sum::<f32>();
+                width = width.max(row_width);
+            }
+            width
+        }
+        MathNode::SizedDelimiter { .. } => font_size,
+        MathNode::Spacing(multiplier) => font_size * multiplier.max(0.0),
+        MathNode::LineBreak => 0.0,
+    }
+}
+
+fn node_spacing(previous: MathNode, current: &MathNode) -> f32 {
+    if matches!(previous, MathNode::Symbol(ref value) if matches!(
+        value.as_str(),
+        "+" | "-" | "×" | "÷" | "±" | "∓" | "⋅" | "∘" | "⊕" | "⊗"
+    )) {
+        return 0.2;
+    }
+    if matches!(current, MathNode::Symbol(value) if matches!(
+        value.as_str(),
+        "+" | "-" | "×" | "÷" | "±" | "∓" | "⋅" | "∘" | "⊕" | "⊗"
+    )) {
+        return 0.2;
+    }
+    if matches!(previous, MathNode::Symbol(ref value) if matches!(
+        value.as_str(),
+        "=" | "≤" | "≥" | "≠" | "≡" | "≈" | "∼" | "≅" | "∝" | "⊥" | "∥" | "∈"
+            | "∉" | "⊂" | "⊆" | "→" | "↦" | "⇒" | "⟹" | "⟺"
+    )) || matches!(current, MathNode::Symbol(value) if matches!(
+        value.as_str(),
+        "=" | "≤" | "≥" | "≠" | "≡" | "≈" | "∼" | "≅" | "∝" | "⊥" | "∥" | "∈"
+            | "∉" | "⊂" | "⊆" | "→" | "↦" | "⇒" | "⟹" | "⟺"
+    )) {
+        return 0.28;
+    }
+    if matches!(previous, MathNode::Text(ref value) if value.ends_with(',') || value.ends_with(';'))
+    {
+        return 0.25;
+    }
+    0.0
+}
+
+fn render_spacing(multiplier: f32, style: &MathStyle, font_size: f32) -> gpui::Div {
+    gpui::div()
+        .font_family(style.font_family.clone())
+        .w(gpui::px(font_size * multiplier))
+}
+
 fn delimiter_element(value: &str, style: &MathStyle, font_size: f32) -> gpui::Div {
     gpui::div()
         .font_family(style.font_family.clone())
@@ -595,7 +1139,7 @@ fn delimiter_element(value: &str, style: &MathStyle, font_size: f32) -> gpui::Di
         .child(SharedString::from(value.to_owned()))
 }
 
-fn styled_symbol(text: &str, style: MathStyleKind, _italic: bool) -> String {
+pub(crate) fn styled_symbol(text: &str, style: MathStyleKind, _italic: bool) -> String {
     if !matches!(
         style,
         MathStyleKind::Blackboard | MathStyleKind::Calligraphic | MathStyleKind::Fraktur
@@ -607,6 +1151,33 @@ fn styled_symbol(text: &str, style: MathStyleKind, _italic: bool) -> String {
     };
     if !character.is_ascii_alphabetic() {
         return text.to_owned();
+    }
+    let special = match (style, character) {
+        (MathStyleKind::Blackboard, 'C') => Some('ℂ'),
+        (MathStyleKind::Blackboard, 'H') => Some('ℍ'),
+        (MathStyleKind::Blackboard, 'N') => Some('ℕ'),
+        (MathStyleKind::Blackboard, 'P') => Some('ℙ'),
+        (MathStyleKind::Blackboard, 'Q') => Some('ℚ'),
+        (MathStyleKind::Blackboard, 'R') => Some('ℝ'),
+        (MathStyleKind::Blackboard, 'Z') => Some('ℤ'),
+        (MathStyleKind::Calligraphic, 'B') => Some('ℬ'),
+        (MathStyleKind::Calligraphic, 'E') => Some('ℰ'),
+        (MathStyleKind::Calligraphic, 'F') => Some('ℱ'),
+        (MathStyleKind::Calligraphic, 'H') => Some('ℋ'),
+        (MathStyleKind::Calligraphic, 'I') => Some('ℐ'),
+        (MathStyleKind::Calligraphic, 'L') => Some('ℒ'),
+        (MathStyleKind::Calligraphic, 'M') => Some('ℳ'),
+        (MathStyleKind::Calligraphic, 'R') => Some('ℛ'),
+        (MathStyleKind::Calligraphic, 'Z') => Some('ℨ'),
+        (MathStyleKind::Fraktur, 'C') => Some('ℭ'),
+        (MathStyleKind::Fraktur, 'H') => Some('ℌ'),
+        (MathStyleKind::Fraktur, 'I') => Some('ℑ'),
+        (MathStyleKind::Fraktur, 'R') => Some('ℜ'),
+        (MathStyleKind::Fraktur, 'Z') => Some('ℨ'),
+        _ => None,
+    };
+    if let Some(special) = special {
+        return special.to_string();
     }
     let (uppercase, lowercase) = match style {
         MathStyleKind::Blackboard => (0x1d538, 0x1d552),
@@ -634,7 +1205,7 @@ mod tests {
     #[test]
     fn parses_symbols_and_scripts() {
         let node = parse_math(r"\forall a \in F, x_i^2 \le \infty");
-        let MathNode::Row(nodes) = node else {
+        let MathNode::Row(ref nodes) = node else {
             panic!("expected row");
         };
         assert!(
@@ -663,6 +1234,68 @@ mod tests {
         assert!(
             matches!(node, MathNode::Row(nodes) if matches!(nodes.first(), Some(MathNode::Matrix { environment, rows }) if environment == "pmatrix" && rows.len() == 2))
         );
+    }
+
+    #[test]
+    fn consumes_sized_delimiters_once() {
+        let node = parse_math(r"\big(x\big)");
+        assert_eq!(format!("{node:?}").matches("SizedDelimiter").count(), 2);
+        assert!(!format!("{node:?}").contains("Text(\"(\")"));
+    }
+
+    #[test]
+    fn parses_control_sequence_spacing() {
+        let node = parse_math(r"a\,b\;c\!d");
+        let MathNode::Row(ref nodes) = node else {
+            panic!("expected row");
+        };
+        assert_eq!(
+            nodes
+                .iter()
+                .filter(|node| matches!(node, MathNode::Spacing(_)))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn parses_upright_operators_and_text_spaces() {
+        let node = parse_math(r"\operatorname{lcm}\sin\text{if and only if}");
+        let MathNode::Row(ref nodes) = node else {
+            panic!("expected row");
+        };
+        assert!(nodes.iter().any(|node| {
+            matches!(
+                node,
+                MathNode::Styled {
+                    style: MathStyleKind::Operator,
+                    content,
+                } if matches!(content.as_ref(), MathNode::Text(value) if value == "lcm")
+            )
+        }));
+        assert!(format!("{node:?}").contains("if and only if"));
+    }
+
+    #[test]
+    fn maps_blackboard_symbols() {
+        assert_eq!(styled_symbol("R", MathStyleKind::Blackboard, false), "ℝ");
+    }
+
+    #[test]
+    fn scans_unicode_environment_bodies_without_swallowing_trailing_text() {
+        let node = parse_math(r"\begin{matrix}\alpha & β\end{matrix}+z");
+        let MathNode::Row(ref nodes) = node else {
+            panic!("expected row");
+        };
+        assert!(matches!(nodes.first(), Some(MathNode::Matrix { .. })));
+        assert!(format!("{node:?}").contains("z"));
+    }
+
+    #[test]
+    fn parses_display_limits_as_scripts() {
+        let node = parse_math(r"\sum_{i=1}^{n}");
+        assert!(format!("{node:?}").contains("Script"));
+        assert!(format!("{node:?}").contains("∑"));
     }
 
     #[test]

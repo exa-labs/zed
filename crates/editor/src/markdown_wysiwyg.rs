@@ -2,8 +2,9 @@ use crate::display_map::{
     BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CustomBlockId,
     FoldPlaceholder, HighlightKey, RenderBlock,
 };
-use crate::markdown_math::{MathStyle, parse_math, render_math};
+use crate::markdown_math::{MathStyle, estimate_math_lines, parse_math, render_math};
 use crate::{Editor, ToggleMarkdownWysiwyg};
+use collections::HashSet;
 use gpui::{
     App, AppContext as _, Context, ElementId, Entity, FontStyle, FontWeight, HighlightStyle, Hsla,
     InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
@@ -11,15 +12,16 @@ use gpui::{
 };
 use multi_buffer::{Anchor, MultiBufferOffset, MultiBufferSnapshot, ToOffset};
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
-use theme::ActiveTheme;
-use util::ResultExt as _;
-use collections::HashSet;
+use settings::Settings;
 use std::any::TypeId;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use theme::ActiveTheme;
+use theme_settings::ThemeSettings;
+use util::ResultExt as _;
 
 /// Global flag that tracks whether WYSIWYG mode should be auto-enabled for
 /// markdown files. When the user toggles WYSIWYG on, this is set to true;
@@ -448,7 +450,8 @@ fn find_math_closer(
         }
         if text.get(search..search + closer.len()) == Some(closer)
             && !is_escaped(text, search)
-            && (search..search + closer.len()).all(|index| !excluded.get(index).copied().unwrap_or(true))
+            && (search..search + closer.len())
+                .all(|index| !excluded.get(index).copied().unwrap_or(true))
         {
             return Some(search);
         }
@@ -476,9 +479,13 @@ fn math_excluded_bytes(text: &str) -> Vec<bool> {
             let mut search = 0;
             while let Some(relative) = content[search..].find('`') {
                 let start = search + relative;
-                let tick_count = content[start..].chars().take_while(|character| *character == '`').count();
+                let tick_count = content[start..]
+                    .chars()
+                    .take_while(|character| *character == '`')
+                    .count();
                 let close_start = start + tick_count;
-                let Some(close_relative) = content[close_start..].find(&"`".repeat(tick_count)) else {
+                let Some(close_relative) = content[close_start..].find(&"`".repeat(tick_count))
+                else {
                     break;
                 };
                 let end = close_start + close_relative + tick_count;
@@ -560,7 +567,8 @@ fn parse_wikilinks(text: &str) -> Vec<WikilinkDecoration> {
     let mut search_start = 0;
     while let Some(start) = text[search_start..].find("[[") {
         let absolute_start = search_start + start;
-        if absolute_start > 0 && text.as_bytes().get(absolute_start.wrapping_sub(1)) == Some(&b'!') {
+        if absolute_start > 0 && text.as_bytes().get(absolute_start.wrapping_sub(1)) == Some(&b'!')
+        {
             search_start = absolute_start + 2;
             continue;
         }
@@ -601,9 +609,7 @@ fn parse_list_items(text: &str) -> Vec<ListItemDecoration> {
         }
     }
     if text.starts_with("- ") || text.starts_with("* ") {
-        results.push(ListItemDecoration {
-            marker_range: 0..2,
-        });
+        results.push(ListItemDecoration { marker_range: 0..2 });
     } else {
         let trimmed = text.trim_start();
         let indent = text.len() - trimmed.len();
@@ -698,11 +704,17 @@ fn parse_line_decorations(text: &str) -> LineDecorations {
                     marker_range: content_start..content_start + marker_len,
                 });
             }
-        } else if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* "))
+        } else if let Some(rest) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
         {
             let checked = if rest.starts_with("[ ] ") || rest == "[ ]" {
                 Some(false)
-            } else if rest.starts_with("[x] ") || rest.starts_with("[X] ") || rest == "[x]" || rest == "[X]" {
+            } else if rest.starts_with("[x] ")
+                || rest.starts_with("[X] ")
+                || rest == "[x]"
+                || rest == "[X]"
+            {
                 Some(true)
             } else {
                 None
@@ -720,8 +732,7 @@ fn parse_line_decorations(text: &str) -> LineDecorations {
                 if (after_digits.starts_with(". ") || after_digits.starts_with(") "))
                     && trimmed.len() > digit_count + 2
                 {
-                    ordered_list_markers
-                        .push(content_start..content_start + digit_count + 1);
+                    ordered_list_markers.push(content_start..content_start + digit_count + 1);
                 }
             }
         }
@@ -962,7 +973,9 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
                     });
                 }
             }
-            Event::Start(Tag::Image { dest_url, title, .. }) => {
+            Event::Start(Tag::Image {
+                dest_url, title, ..
+            }) => {
                 let url = dest_url.to_string();
                 let mut end = range.end;
                 if let Some(pos) = text[range.start..].find(')') {
@@ -1111,7 +1124,9 @@ fn range_contains_cursor(range: &Range<usize>, cursor: usize) -> bool {
 fn cursor_line_range(text: &str, cursor: usize) -> Range<usize> {
     let cursor = cursor.min(text.len());
     let line_start = text[..cursor].rfind('\n').map_or(0, |pos| pos + 1);
-    let line_end = text[cursor..].find('\n').map_or(text.len(), |pos| cursor + pos);
+    let line_end = text[cursor..]
+        .find('\n')
+        .map_or(text.len(), |pos| cursor + pos);
     line_start..line_end
 }
 
@@ -1135,7 +1150,10 @@ impl Editor {
             {
                 self.show_line_numbers = show_line_numbers;
             }
-            if let Some(soft_wrap) = self.markdown_wysiwyg_state.previous_soft_wrap_override.take()
+            if let Some(soft_wrap) = self
+                .markdown_wysiwyg_state
+                .previous_soft_wrap_override
+                .take()
             {
                 self.soft_wrap_mode_override = soft_wrap;
             }
@@ -1161,8 +1179,7 @@ impl Editor {
             self.style = None;
 
             self.set_show_gutter(false, cx);
-            self.soft_wrap_mode_override =
-                Some(language::language_settings::SoftWrap::Bounded);
+            self.soft_wrap_mode_override = Some(language::language_settings::SoftWrap::Bounded);
             self.preferred_line_length_override = Some(READABLE_LINE_LENGTH);
             self.display_map
                 .update(cx, |display_map, cx| display_map.set_hang_indent(true, cx));
@@ -1222,9 +1239,9 @@ pub fn schedule_wysiwyg_refresh(editor: &mut Editor, cx: &mut Context<Editor>) {
         // Snapshot the text on the foreground (a cheap rope copy), then run the
         // markdown parse on a background thread. Parsing the whole buffer on the
         // UI thread on every edit was a large part of the per-keystroke cost.
-        let Ok(text) =
-            editor.read_with(cx, |editor, cx| editor.buffer().read(cx).snapshot(cx).text())
-        else {
+        let Ok(text) = editor.read_with(cx, |editor, cx| {
+            editor.buffer().read(cx).snapshot(cx).text()
+        }) else {
             return;
         };
 
@@ -1292,7 +1309,14 @@ fn apply_wysiwyg_decorations(
     // Use the full selection range (covers all lines in a multi-line selection)
     let active_line_range = selection_line_range(editor, text, cx);
 
-    apply_highlights(editor, snapshot, decorations, cursor, &active_line_range, cx);
+    apply_highlights(
+        editor,
+        snapshot,
+        decorations,
+        cursor,
+        &active_line_range,
+        cx,
+    );
     remove_stale_folds(editor, cx);
     apply_marker_folds(
         editor,
@@ -1318,15 +1342,24 @@ fn refresh_active_line_decorations(editor: &mut Editor, cx: &mut Context<Editor>
     let cursor = cursor_offset(editor, cx);
     let active_line_range = selection_line_range(editor, &text, cx);
 
-    let previous_active_line_range =
-        editor.markdown_wysiwyg_state.previous_active_line_range.clone();
+    let previous_active_line_range = editor
+        .markdown_wysiwyg_state
+        .previous_active_line_range
+        .clone();
     if previous_active_line_range.as_ref() == Some(&active_line_range) {
         return;
     }
 
     let decorations = parse_markdown_decorations(&text);
 
-    apply_highlights(editor, &snapshot, &decorations, cursor, &active_line_range, cx);
+    apply_highlights(
+        editor,
+        &snapshot,
+        &decorations,
+        cursor,
+        &active_line_range,
+        cx,
+    );
 
     // Re-fold the markers on the line the cursor just left so it renders again.
     if let Some(previous) = previous_active_line_range.as_ref() {
@@ -1559,8 +1592,15 @@ fn apply_highlights(
 
     // Collect diagnostics for the full buffer to detect unresolved links
     let all_diagnostics: Vec<(Range<usize>, String)> = snapshot
-        .diagnostics_in_range::<MultiBufferOffset>(MultiBufferOffset(0)..MultiBufferOffset(snapshot.len().0))
-        .map(|entry| (entry.range.start.0..entry.range.end.0, entry.diagnostic.message.clone()))
+        .diagnostics_in_range::<MultiBufferOffset>(
+            MultiBufferOffset(0)..MultiBufferOffset(snapshot.len().0),
+        )
+        .map(|entry| {
+            (
+                entry.range.start.0..entry.range.end.0,
+                entry.diagnostic.message.clone(),
+            )
+        })
         .collect();
 
     let mut wikilink_ranges = Vec::new();
@@ -1811,14 +1851,16 @@ fn callout_appearance(kind: &str) -> (&'static str, Hsla) {
 }
 
 fn marker_overlaps_block(marker: &Range<usize>, block_ranges: &[Range<usize>]) -> bool {
-    block_ranges.iter().any(|block| {
-        marker.start < block.end && marker.end > block.start
-    })
+    block_ranges
+        .iter()
+        .any(|block| marker.start < block.end && marker.end > block.start)
 }
 
 fn render_cell_segment(
     parent: gpui::Div,
     segment: &CellSegment,
+    base_font_size: f32,
+    text_color: Hsla,
 ) -> gpui::Div {
     match segment {
         CellSegment::Text {
@@ -1856,15 +1898,9 @@ fn render_cell_segment(
             italic,
         } => {
             let style = MathStyle {
-                base_font_size: 16.0,
-                text_color: Hsla {
-                    h: 0.0,
-                    s: 0.0,
-                    l: 0.9,
-                    a: 1.0,
-                },
+                base_font_size,
+                text_color,
                 font_family: wysiwyg_serif_family(),
-                font_fallbacks: wysiwyg_serif_fallbacks(),
             };
             let mut math = gpui::div().child(render_math(&parse_math(source), &style, false));
             if *bold {
@@ -1875,13 +1911,7 @@ fn render_cell_segment(
             }
             parent.child(math)
         }
-        CellSegment::LineBreak => {
-            parent.child(
-                gpui::div()
-                    .w_full()
-                    .h(gpui::px(0.0)),
-            )
-        }
+        CellSegment::LineBreak => parent.child(gpui::div().w_full().h(gpui::px(0.0))),
     }
 }
 
@@ -1931,6 +1961,7 @@ fn apply_marker_folds(
     };
 
     let mut creases = Vec::new();
+    let base_font_size: f32 = ThemeSettings::get_global(cx).buffer_font_size(cx).into();
     for math in &decorations.math {
         if math.display
             || !within_restriction(&math.range)
@@ -1941,10 +1972,9 @@ fn apply_marker_folds(
         }
         let node = parse_math(&math.source);
         let style = MathStyle {
-            base_font_size: 16.0,
+            base_font_size,
             text_color: cx.theme().colors().editor_foreground,
             font_family: wysiwyg_serif_family(),
-            font_fallbacks: wysiwyg_serif_fallbacks(),
         };
         let placeholder = FoldPlaceholder {
             render: Arc::new({
@@ -2044,12 +2074,7 @@ fn apply_marker_folds(
                 .items_center()
                 .h_full()
                 .pr(gpui::px(14.0))
-                .child(
-                    gpui::div()
-                        .w(gpui::px(3.0))
-                        .h_full()
-                        .bg(quote_bar_color),
-                )
+                .child(gpui::div().w(gpui::px(3.0)).h_full().bg(quote_bar_color))
                 .into_any_element()
         }),
         constrain_width: false,
@@ -2117,7 +2142,9 @@ fn apply_marker_folds(
     }
 
     if !creases.is_empty() {
-        editor.display_map.update(cx, |map, cx| map.fold(creases, cx));
+        editor
+            .display_map
+            .update(cx, |map, cx| map.fold(creases, cx));
         cx.notify();
     }
 }
@@ -2156,13 +2183,12 @@ fn apply_blocks(
         let end = snapshot.anchor_after(MultiBufferOffset(math.range.end));
         let node = parse_math(&math.source);
         let source_line_count = math.source.lines().count().max(1) as u32;
-        let source = math.source.clone();
+        let estimated_height = estimate_math_lines(&node).max(source_line_count);
         let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
             let style = MathStyle {
                 base_font_size: (block_context.em_width * 1.2).into(),
                 text_color: block_context.app.theme().colors().editor_foreground,
                 font_family: wysiwyg_serif_family(),
-                font_fallbacks: wysiwyg_serif_fallbacks(),
             };
             gpui::div()
                 .id(ElementId::Name(SharedString::from(format!(
@@ -2173,19 +2199,11 @@ fn apply_blocks(
                 .child(render_math(&node, &style, true))
                 .into_any_element()
         });
-        let extra_height = if source.contains("\\frac")
-            || source.contains("\\sqrt")
-            || source.contains("\\begin")
-        {
-            1
-        } else {
-            0
-        };
         block_ranges.push(math.range.clone());
         block_anchors.push(start..end);
         block_properties.push(BlockProperties {
             placement: BlockPlacement::Replace(start..=end),
-            height: Some(source_line_count + extra_height),
+            height: Some(estimated_height),
             style: BlockStyle::Flex,
             render,
             priority: 0,
@@ -2316,7 +2334,12 @@ fn apply_blocks(
                     .border_r_1()
                     .border_color(border_color);
                 for segment in header {
-                    cell_div = render_cell_segment(cell_div, segment);
+                    cell_div = render_cell_segment(
+                        cell_div,
+                        segment,
+                        (block_context.em_width * 1.2).into(),
+                        block_context.app.theme().colors().editor_foreground,
+                    );
                 }
                 header_row = header_row.child(cell_div);
             }
@@ -2344,7 +2367,12 @@ fn apply_blocks(
                         .border_r_1()
                         .border_color(border_color);
                     for segment in cell {
-                        cell_div = render_cell_segment(cell_div, segment);
+                        cell_div = render_cell_segment(
+                            cell_div,
+                            segment,
+                            (block_context.em_width * 1.2).into(),
+                            block_context.app.theme().colors().editor_foreground,
+                        );
                     }
                     row_element = row_element.child(cell_div);
                 }
@@ -2353,9 +2381,10 @@ fn apply_blocks(
 
             let table_total_width: f32 = column_widths.iter().sum();
             let scrollable_wrapper = gpui::div()
-                .id(ElementId::Name(
-                    SharedString::from(format!("wysiwyg-table-{}", table_index)),
-                ))
+                .id(ElementId::Name(SharedString::from(format!(
+                    "wysiwyg-table-{}",
+                    table_index
+                ))))
                 .overflow_x_scroll()
                 .max_w(block_context.max_width * 0.7)
                 .child(inner_table.w(gpui::px(table_total_width)));
@@ -2441,7 +2470,11 @@ fn apply_blocks(
                             .border_color(border_color)
                             .bg(background)
                             .cursor_pointer()
-                            .child(gpui::div().text_color(icon_color).child(SharedString::from("▶")))
+                            .child(
+                                gpui::div()
+                                    .text_color(icon_color)
+                                    .child(SharedString::from("▶")),
+                            )
                             .child(gpui::div().text_color(label_color).child(label.clone()))
                             .on_click(move |_event, _window, cx| {
                                 if let Some(path) = &target_path {
@@ -2546,8 +2579,8 @@ fn apply_blocks(
     let mut new_matched: Vec<bool> = vec![false; block_ranges.len()];
 
     for (id, old_anchor_range) in old_blocks {
-        let resolved =
-            old_anchor_range.start.to_offset(snapshot).0..old_anchor_range.end.to_offset(snapshot).0;
+        let resolved = old_anchor_range.start.to_offset(snapshot).0
+            ..old_anchor_range.end.to_offset(snapshot).0;
         let mut matched = false;
         for (i, new_range) in block_ranges.iter().enumerate() {
             if !new_matched[i] && resolved == *new_range {
@@ -2603,7 +2636,10 @@ fn apply_references_block(
     // The block's anchor follows the document end across edits, so it only needs
     // rebuilding when the reference list itself changes. Skipping when unchanged
     // avoids removing and re-inserting the block on every cursor move.
-    let already_rendered = !editor.markdown_wysiwyg_state.references_block_ids.is_empty()
+    let already_rendered = !editor
+        .markdown_wysiwyg_state
+        .references_block_ids
+        .is_empty()
         && editor.markdown_wysiwyg_state.rendered_references == references;
     if already_rendered {
         return;
@@ -2641,20 +2677,10 @@ fn apply_references_block(
             a: 0.2,
         };
 
-        let mut container = gpui::div()
-            .pl(left_margin)
-            .pt_4()
-            .flex()
-            .flex_col()
-            .gap_1();
+        let mut container = gpui::div().pl(left_margin).pt_4().flex().flex_col().gap_1();
 
         // Divider line
-        container = container.child(
-            gpui::div()
-                .h(gpui::px(1.0))
-                .bg(border_color)
-                .mb_2(),
-        );
+        container = container.child(gpui::div().h(gpui::px(1.0)).bg(border_color).mb_2());
 
         // Header
         container = container.child(
@@ -2674,11 +2700,7 @@ fn apply_references_block(
         // Reference entries
         for ref_name in &references {
             container = container.child(
-                gpui::div()
-                    .flex()
-                    .flex_row()
-                    .gap_1()
-                    .child(
+                gpui::div().flex().flex_row().gap_1().child(
                         gpui::div()
                             .text_color(Hsla {
                                 h: 0.6,
@@ -2752,7 +2774,8 @@ pub fn fetch_references(editor: &mut Editor, cx: &mut Context<Editor>) {
                     continue;
                 }
                 // Skip the current file
-                let entry_stem = path.file_stem()
+                let entry_stem = path
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_string();
@@ -2779,12 +2802,14 @@ pub fn fetch_references(editor: &mut Editor, cx: &mut Context<Editor>) {
 
         backlink_files.sort();
 
-        editor.update(cx, |editor, cx| {
+        editor
+            .update(cx, |editor, cx| {
             editor.markdown_wysiwyg_state.cached_references = backlink_files;
             if editor.markdown_wysiwyg_state.active {
                 refresh_wysiwyg_decorations(editor, cx);
             }
-        }).ok();
+            })
+            .ok();
     });
 }
 
@@ -2804,9 +2829,7 @@ fn clear_wysiwyg_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     let type_id = TypeId::of::<WysiwygFoldTag>();
     let snapshot = editor.buffer().read(cx).snapshot(cx);
     let buffer_len = snapshot.len();
-    let full_range = vec![
-        MultiBufferOffset(0)..buffer_len,
-    ];
+    let full_range = vec![MultiBufferOffset(0)..buffer_len];
     editor.remove_folds_with_type(&full_range, type_id, false, cx);
 
     let old_block_ids: HashSet<CustomBlockId> = editor
@@ -2845,8 +2868,12 @@ pub fn on_selection_changed(editor: &mut Editor, window: &mut Window, cx: &mut C
     // rows are revealed, so this avoids re-parsing the document on every
     // keystroke (the dominant source of typing lag).
     let anchor = editor.selections.newest_anchor();
-    let head_row = snapshot.offset_to_point(anchor.head().to_offset(&snapshot)).row;
-    let tail_row = snapshot.offset_to_point(anchor.tail().to_offset(&snapshot)).row;
+    let head_row = snapshot
+        .offset_to_point(anchor.head().to_offset(&snapshot))
+        .row;
+    let tail_row = snapshot
+        .offset_to_point(anchor.tail().to_offset(&snapshot))
+        .row;
     let active_rows = head_row.min(tail_row)..head_row.max(tail_row);
     if editor.markdown_wysiwyg_state.previous_active_rows.as_ref() == Some(&active_rows) {
         return;
@@ -2861,14 +2888,19 @@ pub fn on_selection_changed(editor: &mut Editor, window: &mut Window, cx: &mut C
         let mut adjustment: Option<usize> = None;
         for heading in &decorations.headings {
             if cursor == heading.line_range.start {
-                let was_block = editor.markdown_wysiwyg_state.block_ids
+                let was_block =
+                    editor
+                        .markdown_wysiwyg_state
+                        .block_ids
                     .iter()
                     .any(|(_, anchor_range)| {
                         anchor_range.start.to_offset(&snapshot).0 == heading.line_range.start
                     });
                 if was_block {
                     let prefix_len = heading.level as usize;
-                    let space_after = if text.as_bytes().get(heading.line_range.start + prefix_len) == Some(&b' ') {
+                    let space_after = if text.as_bytes().get(heading.line_range.start + prefix_len)
+                        == Some(&b' ')
+                    {
                         1
                     } else {
                         0
@@ -3025,7 +3057,8 @@ fn is_image_path(path: &Path) -> bool {
     matches!(
         extension.as_deref(),
         Some(
-            "png" | "jpg"
+            "png"
+                | "jpg"
                 | "jpeg"
                 | "gif"
                 | "webp"
@@ -3206,5 +3239,19 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert!(spans[0].display);
         assert_eq!(spans[0].source, "a\n+b");
+    }
+
+    #[test]
+    fn math_spans_work_inside_headings_lists_and_links() {
+        let text = "# Heading $x$\n- item $y$\n[link $z$](https://example.com)\n[[wiki $w$]]";
+        let spans = parse_math_spans(text);
+        assert_eq!(spans.len(), 4);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.source.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x", "y", "z", "w"]
+        );
     }
 }
