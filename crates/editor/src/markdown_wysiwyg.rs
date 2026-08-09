@@ -2,6 +2,7 @@ use crate::display_map::{
     BlockContext, BlockPlacement, BlockProperties, BlockStyle, Crease, CustomBlockId,
     FoldPlaceholder, HighlightKey, RenderBlock,
 };
+use crate::markdown_math::{MathStyle, parse_math, render_math};
 use crate::{Editor, ToggleMarkdownWysiwyg};
 use gpui::{
     App, AppContext as _, Context, ElementId, Entity, FontStyle, FontWeight, HighlightStyle, Hsla,
@@ -38,7 +39,7 @@ const READABLE_LINE_LENGTH: u32 = 60;
 /// be a serif that ships with the host OS by default rather than a single
 /// hardcoded name (a Linux-only face like "Liberation Serif" renders as
 /// monospace on macOS, which is what made the document look like code).
-fn wysiwyg_serif_family() -> SharedString {
+pub(crate) fn wysiwyg_serif_family() -> SharedString {
     if cfg!(target_os = "macos") {
         SharedString::new_static("Palatino")
     } else if cfg!(target_os = "windows") {
@@ -50,7 +51,7 @@ fn wysiwyg_serif_family() -> SharedString {
 
 /// Cross-platform serif chain used for glyph coverage when the primary family
 /// lacks a specific glyph. Unknown families are ignored by the resolver.
-fn wysiwyg_serif_fallbacks() -> gpui::FontFallbacks {
+pub(crate) fn wysiwyg_serif_fallbacks() -> gpui::FontFallbacks {
     gpui::FontFallbacks::from_fonts(vec![
         "Palatino".to_owned(),
         "Hoefler Text".to_owned(),
@@ -151,6 +152,11 @@ enum CellSegment {
         bold: bool,
         italic: bool,
     },
+    Math {
+        source: String,
+        bold: bool,
+        italic: bool,
+    },
     Code(String),
     LineBreak,
 }
@@ -160,6 +166,7 @@ impl CellSegment {
         match self {
             CellSegment::Text { content, .. } => content.len(),
             CellSegment::Code(content) => content.len(),
+            CellSegment::Math { source, .. } => source.len(),
             CellSegment::LineBreak => 1,
         }
     }
@@ -214,6 +221,13 @@ struct HorizontalRuleDecoration {
     range: Range<usize>,
 }
 
+#[derive(Clone)]
+struct MathDecoration {
+    range: Range<usize>,
+    source: String,
+    display: bool,
+}
+
 struct BlockIdDecoration {
     range: Range<usize>,
 }
@@ -231,6 +245,7 @@ struct MarkdownDecorations {
     blockquotes: Vec<BlockquoteDecoration>,
     callouts: Vec<CalloutDecoration>,
     horizontal_rules: Vec<HorizontalRuleDecoration>,
+    math: Vec<MathDecoration>,
     ordered_list_markers: Vec<Range<usize>>,
     block_ids: Vec<BlockIdDecoration>,
 }
@@ -288,6 +303,13 @@ impl MarkdownDecorations {
 
         self.horizontal_rules.len().hash(&mut hasher);
 
+        self.math.len().hash(&mut hasher);
+        for math in &self.math {
+            math.display.hash(&mut hasher);
+            (math.range.end - math.range.start).hash(&mut hasher);
+            math.source.len().hash(&mut hasher);
+        }
+
         self.ordered_list_markers.len().hash(&mut hasher);
         for marker in &self.ordered_list_markers {
             (marker.end - marker.start).hash(&mut hasher);
@@ -305,6 +327,185 @@ fn parse_options() -> Options {
     options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_TASKLISTS);
     options
+}
+
+fn parse_math_spans(text: &str) -> Vec<MathDecoration> {
+    let excluded = math_excluded_bytes(text);
+    let mut spans = Vec::new();
+    let mut position = 0;
+    while position < text.len() {
+        if excluded.get(position).copied().unwrap_or(true) {
+            position += 1;
+            continue;
+        }
+        if text.as_bytes().get(position) == Some(&b'\\')
+            && text.as_bytes().get(position + 1) == Some(&b'[')
+        {
+            if let Some(end) = find_math_closer(text, position + 2, "\\]", &excluded, true) {
+                spans.push(MathDecoration {
+                    range: position..end + 2,
+                    source: text[position + 2..end].to_owned(),
+                    display: true,
+                });
+                position = end + 2;
+                continue;
+            }
+        } else if text.as_bytes().get(position) == Some(&b'$')
+            && text.as_bytes().get(position + 1) == Some(&b'$')
+            && !is_escaped(text, position)
+        {
+            if let Some(end) = find_math_closer(text, position + 2, "$$", &excluded, true) {
+                spans.push(MathDecoration {
+                    range: position..end + 2,
+                    source: text[position + 2..end].to_owned(),
+                    display: true,
+                });
+                position = end + 2;
+                continue;
+            }
+        } else if text.as_bytes().get(position) == Some(&b'\\')
+            && text.as_bytes().get(position + 1) == Some(&b'(')
+        {
+            if let Some(end) = find_math_closer(text, position + 2, "\\)", &excluded, false) {
+                spans.push(MathDecoration {
+                    range: position..end + 2,
+                    source: text[position + 2..end].to_owned(),
+                    display: false,
+                });
+                position = end + 2;
+                continue;
+            }
+        } else if text.as_bytes().get(position) == Some(&b'$')
+            && !is_escaped(text, position)
+            && text.as_bytes().get(position + 1) != Some(&b'$')
+        {
+            if let Some(end) = find_math_closer(text, position + 1, "$", &excluded, false) {
+                if end > position + 1
+                    && text.as_bytes().get(end + 1) != Some(&b'$')
+                    && !text[position + 1..end].contains('\n')
+                {
+                    spans.push(MathDecoration {
+                        range: position..end + 1,
+                        source: text[position + 1..end].to_owned(),
+                        display: false,
+                    });
+                    position = end + 1;
+                    continue;
+                }
+            }
+        }
+        position += 1;
+    }
+    spans
+}
+
+fn push_table_text_segments(
+    segments: &mut Vec<CellSegment>,
+    content: &str,
+    bold: bool,
+    italic: bool,
+) {
+    let spans = parse_math_spans(content);
+    let mut position = 0;
+    for span in spans {
+        if span.display || span.range.start < position {
+            continue;
+        }
+        if span.range.start > position {
+            segments.push(CellSegment::Text {
+                content: content[position..span.range.start].to_owned(),
+                bold,
+                italic,
+            });
+        }
+        segments.push(CellSegment::Math {
+            source: span.source,
+            bold,
+            italic,
+        });
+        position = span.range.end;
+    }
+    if position < content.len() {
+        segments.push(CellSegment::Text {
+            content: content[position..].to_owned(),
+            bold,
+            italic,
+        });
+    }
+}
+
+fn find_math_closer(
+    text: &str,
+    start: usize,
+    closer: &str,
+    excluded: &[bool],
+    allow_newlines: bool,
+) -> Option<usize> {
+    let mut search = start;
+    while search + closer.len() <= text.len() {
+        if !allow_newlines && text.as_bytes().get(search) == Some(&b'\n') {
+            return None;
+        }
+        if text.get(search..search + closer.len()) == Some(closer)
+            && !is_escaped(text, search)
+            && (search..search + closer.len()).all(|index| !excluded.get(index).copied().unwrap_or(true))
+        {
+            return Some(search);
+        }
+        search += 1;
+    }
+    None
+}
+
+fn math_excluded_bytes(text: &str) -> Vec<bool> {
+    let mut excluded = vec![false; text.len()];
+    let mut in_fence = false;
+    let mut line_start = 0;
+    for line in text.split_inclusive('\n') {
+        let content = line.trim_end_matches('\n').trim_end_matches('\r');
+        let trimmed = content.trim_start();
+        let indented = content.starts_with("    ") || content.starts_with('\t');
+        let fence = trimmed.starts_with("```") || trimmed.starts_with("~~~");
+        if fence || in_fence || indented {
+            for index in line_start..line_start + line.len() {
+                if let Some(value) = excluded.get_mut(index) {
+                    *value = true;
+                }
+            }
+        } else {
+            let mut search = 0;
+            while let Some(relative) = content[search..].find('`') {
+                let start = search + relative;
+                let tick_count = content[start..].chars().take_while(|character| *character == '`').count();
+                let close_start = start + tick_count;
+                let Some(close_relative) = content[close_start..].find(&"`".repeat(tick_count)) else {
+                    break;
+                };
+                let end = close_start + close_relative + tick_count;
+                for index in line_start + start..line_start + end {
+                    if let Some(value) = excluded.get_mut(index) {
+                        *value = true;
+                    }
+                }
+                search = end;
+            }
+        }
+        if fence {
+            in_fence = !in_fence;
+        }
+        line_start += line.len();
+    }
+    excluded
+}
+
+fn is_escaped(text: &str, position: usize) -> bool {
+    let mut slash_count = 0;
+    let mut cursor = position;
+    while cursor > 0 && text.as_bytes().get(cursor - 1) == Some(&b'\\') {
+        slash_count += 1;
+        cursor -= 1;
+    }
+    slash_count % 2 == 1
 }
 
 fn parse_image_dimensions(title: &str) -> (Option<u32>, Option<u32>) {
@@ -571,6 +772,7 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
     let parser = Parser::new_ext(text, parse_options());
 
     let (mut inline_decorations, mut syntax_markers) = parse_highlights(text);
+    let math = parse_math_spans(text);
     let mut headings = Vec::new();
     let mut tables = Vec::new();
     let mut images: Vec<ImageDecoration> = parse_wikilink_images(text);
@@ -817,11 +1019,12 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
             }
             Event::Text(text_content) => {
                 if in_table_cell {
-                    current_cell.push(CellSegment::Text {
-                        content: text_content.to_string(),
-                        bold: cell_bold,
-                        italic: cell_italic,
-                    });
+                    push_table_text_segments(
+                        &mut current_cell,
+                        &text_content,
+                        cell_bold,
+                        cell_italic,
+                    );
                 }
             }
             Event::SoftBreak | Event::HardBreak => {
@@ -870,6 +1073,7 @@ fn parse_markdown_decorations(text: &str) -> MarkdownDecorations {
         blockquotes: line_decorations.blockquotes,
         callouts: line_decorations.callouts,
         horizontal_rules,
+        math,
         ordered_list_markers: line_decorations.ordered_list_markers,
         block_ids,
     }
@@ -1511,6 +1715,11 @@ fn collect_block_replaced_ranges(
             block_ranges.push(rule.range.clone());
         }
     }
+    for math in &decorations.math {
+        if math.display && !range_on_cursor_line(&math.range, active_range) {
+            block_ranges.push(math.range.clone());
+        }
+    }
     block_ranges.sort_by_key(|range| range.start);
     block_ranges
 }
@@ -1641,6 +1850,31 @@ fn render_cell_segment(
                 .child(SharedString::from(content.clone()));
             parent.child(code_element)
         }
+        CellSegment::Math {
+            source,
+            bold,
+            italic,
+        } => {
+            let style = MathStyle {
+                base_font_size: 16.0,
+                text_color: Hsla {
+                    h: 0.0,
+                    s: 0.0,
+                    l: 0.9,
+                    a: 1.0,
+                },
+                font_family: wysiwyg_serif_family(),
+                font_fallbacks: wysiwyg_serif_fallbacks(),
+            };
+            let mut math = gpui::div().child(render_math(&parse_math(source), &style, false));
+            if *bold {
+                math = math.font_weight(FontWeight::BOLD);
+            }
+            if *italic {
+                math = math.italic();
+            }
+            parent.child(math)
+        }
         CellSegment::LineBreak => {
             parent.child(
                 gpui::div()
@@ -1697,6 +1931,38 @@ fn apply_marker_folds(
     };
 
     let mut creases = Vec::new();
+    for math in &decorations.math {
+        if math.display
+            || !within_restriction(&math.range)
+            || range_on_cursor_line(&math.range, active_range)
+            || marker_overlaps_block(&math.range, &block_ranges)
+        {
+            continue;
+        }
+        let node = parse_math(&math.source);
+        let style = MathStyle {
+            base_font_size: 16.0,
+            text_color: cx.theme().colors().editor_foreground,
+            font_family: wysiwyg_serif_family(),
+            font_fallbacks: wysiwyg_serif_fallbacks(),
+        };
+        let placeholder = FoldPlaceholder {
+            render: Arc::new({
+                let node = node.clone();
+                let style = style.clone();
+                move |_fold_id, _range, _cx| render_math(&node, &style, false)
+            }),
+            constrain_width: false,
+            merge_adjacent: false,
+            type_tag: Some(TypeId::of::<WysiwygFoldTag>()),
+            collapsed_text: Some("".into()),
+        };
+        creases.push(Crease::simple(
+            MultiBufferOffset(math.range.start)..MultiBufferOffset(math.range.end),
+            placeholder,
+        ));
+    }
+
     for marker in &decorations.syntax_markers {
         if marker.range.start < marker.range.end
             && within_restriction(&marker.range)
@@ -1881,6 +2147,50 @@ fn apply_blocks(
     let mut block_properties: Vec<BlockProperties<Anchor>> = Vec::new();
     let mut block_ranges: Vec<Range<usize>> = Vec::new();
     let mut block_anchors: Vec<Range<Anchor>> = Vec::new();
+
+    for (math_index, math) in decorations.math.iter().enumerate() {
+        if !math.display || range_on_cursor_line(&math.range, active_range) {
+            continue;
+        }
+        let start = snapshot.anchor_before(MultiBufferOffset(math.range.start));
+        let end = snapshot.anchor_after(MultiBufferOffset(math.range.end));
+        let node = parse_math(&math.source);
+        let source_line_count = math.source.lines().count().max(1) as u32;
+        let source = math.source.clone();
+        let render: RenderBlock = Arc::new(move |block_context: &mut BlockContext| {
+            let style = MathStyle {
+                base_font_size: (block_context.em_width * 1.2).into(),
+                text_color: block_context.app.theme().colors().editor_foreground,
+                font_family: wysiwyg_serif_family(),
+                font_fallbacks: wysiwyg_serif_fallbacks(),
+            };
+            gpui::div()
+                .id(ElementId::Name(SharedString::from(format!(
+                    "wysiwyg-math-{math_index}"
+                ))))
+                .pl(block_context.anchor_x)
+                .py_1()
+                .child(render_math(&node, &style, true))
+                .into_any_element()
+        });
+        let extra_height = if source.contains("\\frac")
+            || source.contains("\\sqrt")
+            || source.contains("\\begin")
+        {
+            1
+        } else {
+            0
+        };
+        block_ranges.push(math.range.clone());
+        block_anchors.push(start..end);
+        block_properties.push(BlockProperties {
+            placement: BlockPlacement::Replace(start..=end),
+            height: Some(source_line_count + extra_height),
+            style: BlockStyle::Flex,
+            render,
+            priority: 0,
+        });
+    }
 
     for heading in &decorations.headings {
         if range_on_cursor_line(&heading.line_range, active_range) {
@@ -2861,4 +3171,40 @@ pub fn try_handle_image_drop(
     });
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn math_spans_skip_code_and_escaped_currency() {
+        let text = "```md\n$code$\n```\n`$inline$` and \\$5 and $x$";
+        let spans = parse_math_spans(text);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].source, "x");
+    }
+
+    #[test]
+    fn math_spans_reject_unmatched_delimiters() {
+        let text = "unmatched $x and another $$display";
+        assert!(parse_math_spans(text).is_empty());
+    }
+
+    #[test]
+    fn math_spans_find_multiple_inline_values() {
+        let spans = parse_math_spans("first $a$ then \\(b+c\\) and $d$");
+        assert_eq!(spans.len(), 3);
+        assert!(!spans[0].display);
+        assert!(!spans[1].display);
+        assert_eq!(spans[2].source, "d");
+    }
+
+    #[test]
+    fn math_spans_support_multiline_display_values() {
+        let spans = parse_math_spans("$$a\n+b$$");
+        assert_eq!(spans.len(), 1);
+        assert!(spans[0].display);
+        assert_eq!(spans[0].source, "a\n+b");
+    }
 }
